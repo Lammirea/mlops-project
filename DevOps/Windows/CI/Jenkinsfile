@@ -1,0 +1,183 @@
+pipeline {
+    agent any
+
+    environment {
+        DOCKERHUB_CREDS=credentials('lab_big_data_two')
+        LC_ALL = "en_US.UTF-8"
+        LANG    = "en_US.UTF-8"
+        LANGUAGE = "en_US.UTF-8"
+    }
+
+    options {
+        timestamps()
+        skipDefaultCheckout(true)
+    }
+
+    stages {
+        stage('Clone github repository') {
+            steps {
+                cleanWs()
+                bat 'chcp 65001 && git clone -b develop https://github.com/Lammirea/big_data_lab_four.git'
+            }
+        }
+
+        stage('Checkout repo dir') {
+            steps {
+                bat 'chcp 65001 && cd big_data_lab_four && dir'
+            }
+        }
+
+        stage('Decrypt ansible-vault files') {
+            // Делаем расшифровку один раз для всего pipeline (тесты + docker-compose)
+            steps {
+                dir('big_data_lab_four') {
+                    // Рекомендуемый вариант: используем Secret file (credentialsId = 'ansible-vault-pass-file')
+                    withCredentials([file(credentialsId: 'vault-pass-id', variable: 'VAULT_PASS_FILE')]) {
+                        bat '''
+                            chcp 65001
+
+                            REM копируем секретный файл (Jenkins дает путь на агенте) в workspace
+                            copy "%VAULT_PASS_FILE%" vault_pass.txt
+
+                            REM создаем скрипт decrypt.sh, который потом выполнится внутри Linux-контейнера
+                            echo #!/bin/bash > decrypt.sh
+                            REM экранируем > в Windows командном интерпретаторе с ^
+                            echo ansible-vault view --vault-password-file vault_pass.txt .env.vault ^> .env >> decrypt.sh
+                            echo ansible-vault view --vault-password-file vault_pass.txt config.ini.vault ^> config.ini >> decrypt.sh
+                            REM сделаем скрипт исполняемым не нужно — запустим через bash
+
+                            REM запускаем Linux-контейнер; внутри него ставим ansible-core и выполняем decrypt.sh
+                            docker run --rm -v "%cd%":/work -w /work python:3.11-bullseye bash -lc "pip install --upgrade pip setuptools wheel ansible-core && bash ./decrypt.sh"
+
+                            REM удаляем временные артефакты
+                            del /Q vault_pass.txt || echo no vault_pass.txt
+                            del /Q decrypt.sh || echo no decrypt.sh
+                        '''
+                    }
+
+                    /*  Альтернатива: если у вас Secret text (ID = 'ansible-vault-pass-text'), используйте:
+                    withCredentials([string(credentialsId: 'ansible-vault-pass-text', variable: 'VAULT_PASS')]) {
+                        bat '''
+                            chcp 65001
+                            echo %VAULT_PASS% > vault_pass.txt
+                            docker run --rm -v "%cd%":/work -w /work williamyeh/ansible:latest bash -lc "ansible-vault view --vault-password-file vault_pass.txt .env.vault > .env && ansible-vault view --vault-password-file vault_pass.txt config.ini.vault > config.ini"
+                            del /Q vault_pass.txt
+                        '''
+                    }
+                    */
+                }
+            }
+        }
+
+        stage('Run Unit Tests (in Docker)') {
+            steps {
+                dir('big_data_lab_four') {
+                bat '''
+                    chcp 65001
+                    docker run --rm -v "%cd%":/app -w /app python:3.11-bullseye bash -lc " \
+                    python -m pip install --upgrade pip setuptools wheel && \
+                    pip install -r requirements.txt coverage pytest --root-user-action=ignore && \
+                    coverage run -m pytest src/unit_tests -q --maxfail=1 --disable-warnings && \
+                    coverage xml -i && \
+                    coverage html -d coverage_html \
+                    "
+                '''
+                }
+            }
+        }
+
+
+        stage('Login'){
+            steps{
+                bat 'chcp 65001 && docker login -u %DOCKERHUB_CREDS_USR% -p %DOCKERHUB_CREDS_PSW%'
+            }
+        }
+
+        stage('Create and run docker container') {
+            steps {
+                script {
+                    try {
+                        bat 'chcp 65001 && cd big_data_lab_four && docker-compose build'
+                    }
+                    finally {
+                        dir('big_data_lab_four') {
+                            withCredentials([
+                                string(credentialsId: 'redis-password', variable: 'REDIS_PASSWORD'),
+                                string(credentialsId: 'redis-host', variable: 'REDIS_HOST'),
+                                string(credentialsId: 'redis-port', variable: 'REDIS_PORT'),
+                                string(credentialsId: 'redis-db', variable: 'REDIS_DB')
+                            ]) {
+                                bat '''
+                                    chcp 65001
+                                    REM --- дописываем параметры redis в .env (уже расшифрована или создана ранее)
+                                    echo REDIS_HOST=%REDIS_HOST% >> .env
+                                    echo REDIS_PORT=%REDIS_PORT% >> .env
+                                    echo REDIS_DB=%REDIS_DB% >> .env
+                                    echo REDIS_PASSWORD=%REDIS_PASSWORD% >> .env
+                                    docker-compose up -d
+                                '''
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Checkout container logs') {
+            steps {
+                dir("big_data_lab_four") {
+                    bat '''
+                        docker-compose up -d
+                        for /f %%i in ('docker ps -qf "name=^big_data_lab_four-web-1"') do set containerId=%%i
+                        echo %containerId%
+                        IF "%containerId%" == "" (
+                            echo "No container running"
+                        )
+                        ELSE (
+                            docker logs --tail 1000 %containerId%
+                        )
+                    '''
+                }
+            }
+        }
+
+        stage('Checkout coverage report') {
+            steps {
+                dir('big_data_lab_four') {
+                // просто вывести краткую сводку
+                bat 'chcp 65001 && type coverage.xml || echo "coverage.xml not found"'
+                // или лучше: опубликовать html через плагин Publish HTML
+                publishHTML (target: [
+                    reportDir: 'coverage_html',
+                    reportFiles: 'index.html',
+                    reportName: 'Coverage Report',
+                    keepAll: true
+                ])
+                }
+            }
+        }
+
+
+        stage('Push'){
+            steps{
+                bat 'chcp 65001 && docker push derelia/big_data_lab_four:latest'
+            }
+        }
+    }
+
+    post {
+        always {
+            bat '''
+                chcp 65001
+                docker stop big_data_lab_four-web-1 || exit /b 0
+                docker rm big_data_lab_four-web-1 || exit /b 0
+                docker stop redis_db || exit /b 0
+                docker rm redis_db || exit /b 0
+                docker rmi derelia/big_data_lab_four:latest || exit /b 0
+                docker rmi redis:latest || exit /b 0
+                docker logout
+            '''
+            cleanWs()
+        }
+    }
+}

@@ -1,0 +1,116 @@
+pipeline {
+    agent any
+
+    triggers {
+        cron('H 9 * * 1') 
+    }
+
+    environment {
+        DOCKERHUB_CREDS = credentials('lab_big_data_two')
+        LC_ALL = "en_US.UTF-8"
+        LANG = "en_US.UTF-8"
+        LANGUAGE = "en_US.UTF-8"
+        COMPOSE_PROJECT_DIR = "big_data_lab_three"
+    }
+
+    options {
+        timestamps()
+        skipDefaultCheckout(false)
+    }
+
+    stages {
+        stage('Clone github repository') {
+            steps {
+                cleanWs()
+                bat '''chcp 65001 && git clone -b develop https://github.com/Lammirea/big_data_lab_three.git'''
+            }
+        }
+
+        stage('Checkout repo dir') {
+            steps {
+                bat '''chcp 65001 && if exist big_data_lab_three (cd big_data_lab_three && dir) else (echo "Directory big_data_lab_three not found" && exit /b 1)'''
+            }
+        }
+
+        stage('Login to DockerHub') {
+            steps {
+                bat '''chcp 65001 && docker login -u %DOCKERHUB_CREDS_USR% -p %DOCKERHUB_CREDS_PSW%'''
+            }
+        }
+
+        stage('Build and Start Services') {
+            steps {
+                dir("${COMPOSE_PROJECT_DIR}") {
+                    withCredentials([
+                        string(credentialsId: 'redis-password', variable: 'REDIS_PASSWORD'),
+                        string(credentialsId: 'redis-host', variable: 'REDIS_HOST'),
+                        string(credentialsId: 'redis-port', variable: 'REDIS_PORT'),
+                        string(credentialsId: 'redis-user-password', variable: 'REDIS_USER_PASSWORD'),
+                        string(credentialsId: 'redis-db', variable: 'REDIS_DB')
+                    ]) {
+                        bat '''
+                        chcp 65001
+                        REM -- create .env for docker-compose (overwrite)
+                        if exist .env del .env
+                        echo REDIS_HOST=%REDIS_HOST% >> .env
+                        echo REDIS_PORT=%REDIS_PORT% >> .env
+                        echo REDIS_DB=%REDIS_DB% >> .env
+                        echo REDIS_USER_PASSWORD=%REDIS_USER_PASSWORD% >> .env
+                        echo REDIS_PASSWORD=%REDIS_PASSWORD% >> .env
+
+                        REM -- build image and bring up services
+                        docker-compose pull derelia/big_data_lab_three:latest
+                        docker-compose build
+                        docker-compose up -d
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Run Functional Tests Inside Container') {
+            steps {
+                dir("${COMPOSE_PROJECT_DIR}") {
+                    script {
+                        bat '''
+                    chcp 65001
+                    setlocal enabledelayedexpansion
+                    for /f "tokens=*" %%i in ('docker-compose ps -q web') do set CONTAINER_ID=%%i
+                    if defined CONTAINER_ID (
+                        echo Found container: !CONTAINER_ID!
+                        docker exec -i !CONTAINER_ID! bash -lc "pytest -v src/tests/test_functional.py"
+                    ) else (
+                        echo "Could not find container id for service 'web'"
+                        docker ps -a
+                        exit /b 1
+                    )
+                    '''
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            dir("${COMPOSE_PROJECT_DIR}") {
+                bat '''
+                chcp 65001
+                echo "Stopping and removing compose services..."
+                docker-compose down -v --remove-orphans || echo "docker-compose down failed (maybe not running)"
+                docker rmi derelia/big_data_lab_three:latest 2>nul || echo "Image derelia/big_data_lab_three:latest not found"
+                '''
+            }
+            bat '''chcp 65001
+            docker logout 2>nul || echo "Not logged in"
+            '''
+            cleanWs()
+        }
+        aborted {
+            echo "Build aborted."
+        }
+        failure {
+            echo "Build failed."
+        }
+    }
+}
