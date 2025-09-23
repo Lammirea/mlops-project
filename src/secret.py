@@ -52,10 +52,3 @@ def get_postgres_config() -> Dict[str, Optional[str]]:
         'POSTGRES_PASSWORD': env_map.get('POSTGRES_PASSWORD') or os.getenv('POSTGRES_PASSWORD')
     }
     return cfg
-
-# Алиас для обратной совместимости (опционально)
-def get_redis_config():
-    """Deprecated: use get_postgres_config instead"""
-    import warnings
-    warnings.warn("get_redis_config is deprecated, use get_postgres_config", DeprecationWarning)
-    return get_postgres_config()
