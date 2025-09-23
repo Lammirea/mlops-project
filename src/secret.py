@@ -15,19 +15,19 @@ def _read_env_file(path: str) -> Dict[str,str]:
                     env[k.strip()] = v.strip().strip('"').strip("'")
     return env
 
-def get_redis_config() -> Dict[str, Optional[str]]:
+def get_postgres_config() -> Dict[str, Optional[str]]:
     """
     Priority:
-     1) big_data_lab_three/.env (created by ansible-vault decrypt)
+     1) mlops_project/.env (created by ansible-vault decrypt)
      2) /run/secrets/* files (docker secrets)
      3) environment variables
     """
     # 1) repo .env (path relative to container working dir)
     possible_paths = [
-        os.path.join(os.getcwd(), 'big_data_lab_three', '.env'),
+        os.path.join(os.getcwd(), 'mlops_project', '.env'),
         os.path.join(os.getcwd(), '.env'),
-        '/etc/secrets/redis_config.json',
-        '/run/secrets/redis_password'  # if separate
+        '/etc/secrets/postgres_config.json',
+        '/run/secrets/postgres_password'  # if separate
     ]
     env_map = {}
     for p in possible_paths:
@@ -37,7 +37,7 @@ def get_redis_config() -> Dict[str, Optional[str]]:
 
     # 2) file-based secrets (individual)
     # if separate files exist, read them
-    for secret_name in ('REDIS_HOST','REDIS_PORT','REDIS_PASSWORD','REDIS_DB'):
+    for secret_name in ('POSTGRES_HOST','POSTGRES_PORT','POSTGRES_DB','POSTGRES_USER','POSTGRES_PASSWORD'):
         path = f'/run/secrets/{secret_name.lower()}'
         if os.path.exists(path):
             with open(path, 'r', encoding='utf-8') as f:
@@ -45,9 +45,17 @@ def get_redis_config() -> Dict[str, Optional[str]]:
 
     # 3) fallback to environment variables if missing
     cfg = {
-        'REDIS_HOST': env_map.get('REDIS_HOST') or os.getenv('REDIS_HOST','localhost'),
-        'REDIS_PORT': env_map.get('REDIS_PORT') or os.getenv('REDIS_PORT','6379'),
-        'REDIS_PASSWORD': env_map.get('REDIS_PASSWORD') or os.getenv('REDIS_PASSWORD'),
-        'REDIS_DB': env_map.get('REDIS_DB') or os.getenv('REDIS_DB','0')
+        'POSTGRES_HOST': env_map.get('POSTGRES_HOST') or os.getenv('POSTGRES_HOST','localhost'),
+        'POSTGRES_PORT': env_map.get('POSTGRES_PORT') or os.getenv('POSTGRES_PORT','5432'),
+        'POSTGRES_DB': env_map.get('POSTGRES_DB') or os.getenv('POSTGRES_DB','postgres'),
+        'POSTGRES_USER': env_map.get('POSTGRES_USER') or os.getenv('POSTGRES_USER','postgres'),
+        'POSTGRES_PASSWORD': env_map.get('POSTGRES_PASSWORD') or os.getenv('POSTGRES_PASSWORD')
     }
     return cfg
+
+# Алиас для обратной совместимости (опционально)
+def get_redis_config():
+    """Deprecated: use get_postgres_config instead"""
+    import warnings
+    warnings.warn("get_redis_config is deprecated, use get_postgres_config", DeprecationWarning)
+    return get_postgres_config()
