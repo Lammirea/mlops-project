@@ -2,8 +2,9 @@
 import os, json, threading, time
 from kafka import KafkaConsumer
 from typing import Callable
-from src.secrets import get_redis_config
-import redis
+from src.secret import get_postgres_config
+import psycopg2
+from psycopg2 import sql
 
 KAFKA_BOOTSTRAP = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'kafka:9092')
 TOPIC = os.getenv('KAFKA_TOPIC','predictions')
@@ -13,18 +14,48 @@ _stop = threading.Event()
 
 def default_handler(msg: dict):
     print("Consumed:", msg)
-    # пример: сохранить результат в redis
-    cfg = get_redis_config()
-    r = redis.Redis(
-        host=cfg['REDIS_HOST'],
-        port=int(cfg['REDIS_PORT']),
-        password=cfg['REDIS_PASSWORD'],
-        db=int(cfg['REDIS_DB']),
-        decode_responses=True
-    )
-    # сохраняем с key = request_id или timestamp
-    key = "prediction:" + str(msg.get('meta', {}).get('request_id', time.time()))
-    r.set(key, json.dumps(msg))
+    # пример: сохранить результат в postgresql
+    cfg = get_postgres_config()
+    try:
+        conn = psycopg2.connect(
+            host=cfg['POSTGRES_HOST'],
+            port=int(cfg['POSTGRES_PORT']),
+            database=cfg['POSTGRES_DB'],
+            user=cfg['POSTGRES_USER'],
+            password=cfg['POSTGRES_PASSWORD']
+        )
+        
+        cursor = conn.cursor()
+        
+        # Создаем таблицу для хранения предсказаний, если её нет
+        create_table_query = """
+        CREATE TABLE IF NOT EXISTS kafka_predictions (
+            id SERIAL PRIMARY KEY,
+            request_id VARCHAR(255),
+            prediction_data TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+        cursor.execute(create_table_query)
+        
+        # сохраняем с key = request_id или timestamp
+        request_id = str(msg.get('meta', {}).get('request_id', time.time()))
+        prediction_data = json.dumps(msg)
+        
+        insert_query = """
+        INSERT INTO kafka_predictions (request_id, prediction_data) 
+        VALUES (%s, %s)
+        """
+        cursor.execute(insert_query, (request_id, prediction_data))
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        print(f"Prediction saved to PostgreSQL with request_id: {request_id}")
+        
+    except Exception as e:
+        print(f"Error saving to PostgreSQL: {e}")
 
 def loop(handler: Callable[[dict], None] = default_handler):
     consumer = KafkaConsumer(
