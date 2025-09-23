@@ -3,56 +3,136 @@ import uvicorn
 import os
 import configparser
 import json
-import redis
+import psycopg2
+from psycopg2 import sql
 from src.train import MultiModel
 from src.predict import Predictor
 from fastapi.encoders import jsonable_encoder
 from src.logger import Logger
 from src.kafka_producer import send_prediction
-from src.secret import get_redis_config
+from src.secret import get_postgres_config
 from src.kafka_consumer import start_in_thread as start_kafka_consumer, stop as stop_kafka_consumer
 
 from contextlib import asynccontextmanager
 
-# Инициализация кастомного логгера
-custom_logger_instance = Logger(show=True)  # show=True — вывод в консоль
-logger = custom_logger_instance.get_logger("AppLogger")  # Получаем логгер
+custom_logger_instance = Logger(show=True)
+logger = custom_logger_instance.get_logger("AppLogger")
 
-# Глобальная переменная для redis клиента; будет инициализирована в startup
-redis_client = None
+pg_connection = None
 consumer_thread = None
 
-def create_redis_client_from_config():
+def create_postgres_connection_from_config():
     """
-    Создаём redis клиент на основе get_redis_config() (чтобы читать .env, docker secrets или env vars).
-    Возвращаем объект redis.Redis или None (если подключение не удалось).
+    Создаём postgresql соединение на основе get_postgres_config().
+    Возвращаем объект psycopg2.connection или None (если подключение не удалось).
     """
-    cfg = get_redis_config()
-    host = cfg.get('REDIS_HOST', 'localhost')
-    port = int(cfg.get('REDIS_PORT', 6379) or 6379)
-    password = cfg.get('REDIS_PASSWORD', None)
-    db = int(cfg.get('REDIS_DB', 0) or 0)
+    cfg = get_postgres_config()
+    host = cfg.get('POSTGRES_HOST', 'localhost')
+    port = int(cfg.get('POSTGRES_PORT', 5432) or 5432)
+    database = cfg.get('POSTGRES_DB', 'postgres')
+    user = cfg.get('POSTGRES_USER', 'postgres')
+    password = cfg.get('POSTGRES_PASSWORD', None)
 
     try:
-        rc = redis.Redis(host=host, port=port, password=password, db=db, decode_responses=True)
+        conn = psycopg2.connect(
+            host=host,
+            port=port,
+            database=database,
+            user=user,
+            password=password
+        )
         # проверка подключения
-        rc.ping()
-        logger.info(f"Connected to Redis at {host}:{port} db={db}")
-        return rc
+        conn.cursor().execute("SELECT 1")
+        logger.info(f"Connected to PostgreSQL at {host}:{port} db={database}")
+        return conn
     except Exception as e:
-        logger.warning(f"Redis not available at startup (best-effort): {e}")
+        logger.warning(f"PostgreSQL not available at startup (best-effort): {e}")
         return None
+
+def init_cache_table():
+    """
+    Создаём таблицу для кэширования результатов, если её нет
+    """
+    if pg_connection is None:
+        return
+    
+    try:
+        cursor = pg_connection.cursor()
+        create_table_query = """
+        CREATE TABLE IF NOT EXISTS prediction_cache (
+            id SERIAL PRIMARY KEY,
+            cache_key VARCHAR(255) UNIQUE,
+            cache_value TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP
+        )
+        """
+        cursor.execute(create_table_query)
+        pg_connection.commit()
+        cursor.close()
+        logger.info("Cache table initialized successfully")
+    except Exception as e:
+        logger.warning(f"Failed to initialize cache table: {e}")
+
+def get_from_cache(cache_key: str):
+    """
+    Получить значение из PostgreSQL кэша
+    """
+    if pg_connection is None:
+        return None
+    
+    try:
+        cursor = pg_connection.cursor()
+        select_query = "SELECT cache_value FROM prediction_cache WHERE cache_key = %s AND (expires_at IS NULL OR expires_at > NOW())"
+        cursor.execute(select_query, (cache_key,))
+        result = cursor.fetchone()
+        cursor.close()
+        
+        if result:
+            return json.loads(result[0])
+        return None
+    except Exception as e:
+        logger.warning(f"Error reading from PostgreSQL cache: {e}")
+        return None
+
+def set_to_cache(cache_key: str, value: dict, expire_minutes: int = 60):
+    """
+    Сохранить значение в PostgreSQL кэш
+    """
+    if pg_connection is None:
+        return
+    
+    try:
+        cursor = pg_connection.cursor()
+        # Удаляем старую запись, если есть
+        delete_query = "DELETE FROM prediction_cache WHERE cache_key = %s"
+        cursor.execute(delete_query, (cache_key,))
+        
+        # Вставляем новую запись
+        insert_query = """
+        INSERT INTO prediction_cache (cache_key, cache_value, expires_at) 
+        VALUES (%s, %s, NOW() + INTERVAL '%s minutes')
+        ON CONFLICT (cache_key) DO UPDATE 
+        SET cache_value = EXCLUDED.cache_value, expires_at = EXCLUDED.expires_at
+        """
+        cursor.execute(insert_query, (cache_key, json.dumps(value), expire_minutes))
+        pg_connection.commit()
+        cursor.close()
+    except Exception as e:
+        logger.warning(f"Error writing to PostgreSQL cache: {e}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global redis_client, consumer_thread
+    global pg_connection, consumer_thread
 
     # Startup
     try:
-        redis_client = create_redis_client_from_config()
+        pg_connection = create_postgres_connection_from_config()
+        if pg_connection:
+            init_cache_table()
     except Exception as e:
-        logger.warning(f"Ошибка при создании Redis клиента: {e}")
-        redis_client = None
+        logger.warning(f"Ошибка при создании PostgreSQL соединения: {e}")
+        pg_connection = None
 
     try:
         logger.info("Starting Kafka consumer thread")
@@ -70,12 +150,48 @@ async def lifespan(app: FastAPI):
         logger.warning(f"Ошибка при остановке Kafka consumer: {e}")
 
     try:
-        if redis_client is not None:
-            redis_client.close()
+        if pg_connection is not None:
+            pg_connection.close()
     except Exception as e:
-        logger.debug(f"Ошибка при закрытии Redis клиента: {e}")
+        logger.debug(f"Ошибка при закрытии PostgreSQL соединения: {e}")
 
 app = FastAPI(lifespan=lifespan)
+
+@app.get("/health")
+async def health_check():
+    """
+    Проверка состояния API и подключений
+    """
+    status = {
+        "status": "healthy",
+        "postgres": "disconnected",
+        "kafka_consumer": "unknown"
+    }
+    
+    # Проверка PostgreSQL
+    try:
+        if pg_connection is not None:
+            pg_connection.cursor().execute("SELECT 1")
+            status["postgres"] = "connected"
+        else:
+            status["postgres"] = "not configured"
+    except Exception as e:
+        status["postgres"] = f"error: {str(e)}"
+    
+    # Проверка Kafka consumer (если возможно)
+    try:
+        if consumer_thread is not None and consumer_thread.is_alive():
+            status["kafka_consumer"] = "running"
+        else:
+            status["kafka_consumer"] = "not running"
+    except Exception:
+        status["kafka_consumer"] = "unknown"
+    
+    overall_status = "healthy" if status["postgres"] in ["connected", "not configured"] else "unhealthy"
+    return {
+        "status": overall_status,
+        "components": status
+    }
 
 @app.post("/train/")
 async def train_model(
@@ -159,25 +275,18 @@ async def predict_model(
     file: UploadFile = None
 ):
     """
-    Эндпоинт предсказаний. Сначала пробуем взять из Redis cache, иначе выполняем Predict.
-    После получения результата: сохраняем в Redis (best-effort) и отправляем сообщение в Kafka (в фоне).
+    Эндпоинт предсказаний. Сначала пробуем взять из PostgreSQL cache, иначе выполняем Predict.
+    После получения результата: сохраняем в PostgreSQL (best-effort) и отправляем сообщение в Kafka (в фоне).
     """
     cache_key = f"predict:{mode}"
 
-    # Попытка чтения из кеша
+    # Попытка чтения из кэша
     try:
-        if redis_client is not None:
-            raw = redis_client.get(cache_key)
-            if raw:
-                try:
-                    parsed = json.loads(raw)
-                    return {"from_cache": True, **parsed}
-                except Exception:
-                    logger.warning("Не удалось распарсить данные из Redis, игнорируем кэш")
-    except redis.exceptions.RedisError as re:
-        logger.warning(f"Redis error while checking cache (treat as cache miss): {re}")
+        cached_result = get_from_cache(cache_key)
+        if cached_result:
+            return {"from_cache": True, **cached_result}
     except Exception as e:
-        logger.warning(f"Unexpected error during Redis cache check: {e}")
+        logger.warning(f"Error during PostgreSQL cache check: {e}")
 
     try:
         predictor = Predictor()
@@ -195,15 +304,11 @@ async def predict_model(
         # JSON-serializable версия
         safe_result = jsonable_encoder(result)
 
-        # Best-effort: сохранить в Redis
+        # Best-effort: сохранить в PostgreSQL кэш
         try:
-            if redis_client is not None:
-                try:
-                    redis_client.set(cache_key, json.dumps(safe_result))
-                except Exception as e:
-                    logger.warning(f"Unexpected error while writing to Redis cache: {e}")
+            set_to_cache(cache_key, safe_result)
         except Exception as e:
-            logger.warning(f"Redis error while storing cache (ignored): {e}")
+            logger.warning(f"Error while writing to PostgreSQL cache: {e}")
 
         # Отправим результат в Kafka в фоне
         try:
@@ -231,13 +336,13 @@ async def receive_result(payload: dict):
     """
     try:
         logger.info(f"Received result via /receive_result: {payload}")
-        # При необходимости можно сохранить payload в Redis, БД и т.д.
+        # При необходимости можно сохранить payload в PostgreSQL, БД и т.д.
         try:
-            if redis_client is not None:
-                key = f"received:{payload.get('meta', {}).get('request_id', '')}"
-                redis_client.set(key, json.dumps(payload))
+            if pg_connection is not None:
+                cache_key = f"received:{payload.get('meta', {}).get('request_id', '')}"
+                set_to_cache(cache_key, payload)
         except Exception as e:
-            logger.warning(f"Не удалось записать полученный результат в Redis: {e}")
+            logger.warning(f"Не удалось записать полученный результат в PostgreSQL: {e}")
         return {"status": "ok"}
     except Exception as e:
         logger.error(f"Ошибка в receive_result: {e}", exc_info=True)
