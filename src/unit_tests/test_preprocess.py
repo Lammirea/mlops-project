@@ -7,16 +7,6 @@ import sys
 # Добавляем путь для импорта модуля train, где определён класс MultiModel
 sys.path.insert(1, os.path.join(os.getcwd(), "src"))
 
-# # Загружаем конфигурацию, если необходимо (можно оставить этот блок, если он используется в preprocess)
-# current_dir = os.path.dirname(os.path.abspath(__file__))
-# config_path = os.path.abspath(os.path.join(current_dir, "../..", "config.ini"))
-# print(f"Пытаемся загрузить конфиг из: {config_path}")
-# if os.path.exists(config_path):
-#     config = configparser.ConfigParser()
-#     config.read(config_path)
-# else:
-#     raise FileNotFoundError(f"Ошибка: файл {config_path} не найден")
-
 import warnings
 
 warnings.filterwarnings("ignore")
