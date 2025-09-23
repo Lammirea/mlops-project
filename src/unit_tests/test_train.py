@@ -31,12 +31,6 @@ class TestTrainModels(unittest.TestCase):
         # Проверяем, что файл модели создан
         self.assertTrue(os.path.exists(self.model.log_reg_path))
 
-    # def test_rand_forest(self):
-    #     """Тест обучения модели RandomForest."""
-    #     res = self.model.rand_forest(use_config=False, n_estimators=5, max_depth=3, predict=False)
-    #     self.assertTrue(res)
-    #     self.assertTrue(os.path.exists(self.model.rand_forest_path))
-
     def test_d_tree(self):
         """Тест обучения модели DecisionTree."""
         res = self.model.d_tree(use_config=False, max_depth=2, min_samples_split=5, predict=False)

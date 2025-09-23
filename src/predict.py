@@ -15,7 +15,8 @@ import traceback
 import yaml
 import numpy as np
 import warnings
-import redis
+import psycopg2
+from psycopg2 import sql
 from src.preprocess import DataMaker
 
 warnings.filterwarnings("ignore")
@@ -176,68 +177,78 @@ class Predictor:
                 self.log.error("Failed to generate predictions: " + traceback.format_exc())
                 sys.exit(1)
 
-            # Получаем параметры подключения из окружения, с безопасными дефолтами
-            redis_host = os.getenv('REDIS_HOST', 'localhost')
+            # Получаем параметры подключения из окружения
+            postgres_host = os.getenv('POSTGRES_HOST', 'localhost')
             try:
-                redis_port = int(os.getenv('REDIS_PORT', 6379))
+                postgres_port = int(os.getenv('POSTGRES_PORT', 5432))
             except ValueError:
-                redis_port = 6379
-            # По умолчанию не ставим пароль — чтобы не приводить к ошибке аутентификации
-            redis_password = os.getenv('REDIS_PASSWORD', None)
-            try:
-                redis_db = int(os.getenv('REDIS_DB', 0))
-            except ValueError:
-                redis_db = 0
+                postgres_port = 5432
+            postgres_db = os.getenv('POSTGRES_DB', 'postgres')
+            postgres_user = os.getenv('POSTGRES_USER', 'postgres')
+            postgres_password = os.getenv('POSTGRES_PASSWORD', None)
 
-            # Попытка подключиться к Redis — но не падаем при ошибке подключения.
+            # Попытка подключиться к PostgreSQL — но не падаем при ошибке подключения.
             try:
-                conn = redis.Redis(
-                    host=redis_host,
-                    port=redis_port,
-                    password=redis_password,
-                    db=redis_db,
-                    socket_connect_timeout=5,
-                    socket_timeout=5,
-                    decode_responses=True,
+                conn = psycopg2.connect(
+                    host=postgres_host,
+                    port=postgres_port,
+                    database=postgres_db,
+                    user=postgres_user,
+                    password=postgres_password,
+                    connect_timeout=5
                 )
-                # Проверим соединение (ping)
-                conn.ping()
-                redis_available = True
-            except (redis.ConnectionError, redis.TimeoutError) as e:
-                self.log.warning(f"Redis not available ({e}). Predictions will be saved locally instead of Redis.")
-                redis_available = False
-            except redis.RedisError as e:
-                self.log.warning(f"Redis error ({e}). Predictions will be saved locally instead of Redis.")
-                redis_available = False
-            except Exception as e:
-                self.log.warning(f"Unexpected error while connecting to Redis ({e}). Saving locally.")
-                redis_available = False
+                # Проверим соединение
+                conn.cursor().execute("SELECT 1")
+                postgres_available = True
+                self.log.info(f"Connected to PostgreSQL at {postgres_host}:{postgres_port}")
+            except (psycopg2.Error, Exception) as e:
+                self.log.warning(f"PostgreSQL not available ({e}). Predictions will be saved locally instead of PostgreSQL.")
+                postgres_available = False
 
-            if redis_available:
+            if postgres_available:
                 try:
+                    cursor = conn.cursor()
+                    
+                    # Создаем таблицу для предсказаний, если её нет
+                    create_table_query = """
+                    CREATE TABLE IF NOT EXISTS predictions (
+                        id SERIAL PRIMARY KEY,
+                        prediction_value TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
+                    cursor.execute(create_table_query)
+                    
                     # Удаляем старые предсказания
-                    conn.delete('predictions')
+                    cursor.execute("DELETE FROM predictions")
+                    
+                    # Вставляем новые предсказания
                     for pred in predictions:
-                        # безопасное преобразование: если pred не int, приведём к int где возможно
+                        # безопасное преобразование
                         try:
-                            val = int(pred)
+                            val = str(int(pred))
                         except Exception:
                             val = str(pred)
-                        conn.rpush('predictions', val)
-
-                    predictions_list = conn.lrange('predictions', 0, -1)
-                    self.log.info("PREDICTIONS WRITTEN TO REDIS")
-                    for i, pred in enumerate(predictions_list):
-                        # pred может быть bytes или str
-                        if isinstance(pred, bytes):
-                            decoded = pred.decode('utf-8', errors='ignore')
-                        else:
-                            decoded = str(pred)
-                        self.log.info(f"Prediction {i + 1}: {decoded}")
+                        
+                        insert_query = "INSERT INTO predictions (prediction_value) VALUES (%s)"
+                        cursor.execute(insert_query, (val,))
+                    
+                    conn.commit()
+                    
+                    # Читаем предсказания обратно для логирования
+                    cursor.execute("SELECT id, prediction_value, created_at FROM predictions ORDER BY id")
+                    predictions_rows = cursor.fetchall()
+                    
+                    self.log.info("PREDICTIONS WRITTEN TO POSTGRESQL")
+                    for row in predictions_rows:
+                        self.log.info(f"Prediction {row[0]}: {row[1]} (created: {row[2]})")
+                    
+                    cursor.close()
+                    conn.close()
 
                 except Exception:
-                    # На случай если при операций с redis случится ошибка — логируем и сохраняем локально
-                    self.log.error("Error while operating on Redis: " + traceback.format_exc())
+                    # На случай если при операций с PostgreSQL случится ошибка — логируем и сохраняем локально
+                    self.log.error("Error while operating on PostgreSQL: " + traceback.format_exc())
                     self._save_predictions_locally(predictions)
             else:
                 # Сохранение локально как резервный вариант
