@@ -81,20 +81,26 @@ pipeline {
                             REM --- запускаем MinIO и инициализируем DVC
                             docker-compose up -d minio minio-init
                             
-                            REM --- ждем пока MinIO запустится
-                            timeout 30
-                            
-                            REM --- устанавливаем DVC и настраиваем remote
-                            docker run --rm -v "%cd%":/app -w /app python:3.11-bullseye bash -lc "
-                            pip install dvc[s3] && \
-                            cd /app && \
-                            dvc init --no-scm && \
-                            dvc remote add -d storage s3://data && \
-                            dvc remote modify storage endpointurl %MINIO_ENDPOINT% && \
-                            dvc remote modify storage access_key_id %MINIO_ACCESS_KEY% && \
-                            dvc remote modify storage secret_access_key %MINIO_SECRET_KEY% && \
-                            echo 'DVC setup completed'
-                            "
+                            REM --- ждем пока MinIO запустится (ожидаем 30 секунд)
+                            timeout /t 30 /nobreak
+                        '''
+                        
+                        // Отдельный шаг для установки DVC
+                        bat '''
+                            chcp 65001
+                            docker run --rm -v "%cd%":/app -w /app python:3.11-bullseye bash -c "pip install --upgrade pip setuptools wheel && pip install dvc[s3]"
+                        '''
+                        
+                        // Отдельный шаг для инициализации DVC
+                        bat '''
+                            chcp 65001
+                            docker run --rm -v "%cd%":/app -w /app python:3.11-bullseye bash -c "cd /app && dvc init --no-scm"
+                        '''
+                        
+                        // Отдельный шаг для настройки remote
+                        bat '''
+                            chcp 65001
+                            docker run --rm -v "%cd%":/app -w /app python:3.11-bullseye bash -c "dvc remote add -d storage s3://data && dvc remote modify storage endpointurl %MINIO_ENDPOINT% && dvc remote modify storage access_key_id %MINIO_ACCESS_KEY% && dvc remote modify storage secret_access_key %MINIO_SECRET_KEY% && echo 'DVC setup completed'"
                         '''
                     }
                 }
@@ -106,7 +112,7 @@ pipeline {
                 dir('mlops-project') {
                 bat '''
                     chcp 65001
-                    docker run --rm -v "%cd%":/app -w /app python:3.11-bullseye bash -lc " \
+                    docker run --rm -v "%cd%":/app -w /app python:3.11-bullseye bash -c " \
                     python -m pip install --upgrade pip setuptools wheel && \
                     pip install -r requirements.txt coverage pytest dvc[s3] --root-user-action=ignore && \
                     coverage run -m pytest src/unit_tests -q --maxfail=1 --disable-warnings && \
@@ -128,7 +134,7 @@ pipeline {
             steps {
                 script {
                     try {
-                        bat 'chcp 65001 && cd mlops_project && docker-compose build'
+                        bat 'chcp 65001 && cd mlops-project && docker-compose build'
                     }
                     finally {
                         dir('mlops-project') {
