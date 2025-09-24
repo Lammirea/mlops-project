@@ -42,23 +42,17 @@ pipeline {
                             if not exist infra\\ansible\\group_vars mkdir infra\\ansible\\group_vars
                             if not exist infra\\ansible\\group_vars\\all mkdir infra\\ansible\\group_vars\\all
 
-                            REM --- создаём временный файл с паролем для ansible-vault (не в коммит)
+                            REM --- создаём временный файл с паролем для ansible-vault (удалим позже)
                             echo %VAULT_PASS% > infra\\ansible\\.vault_pass.txt
 
-                            REM --- преобразуем Windows-путь в WSL-путь через wslpath
-                            for /f "usebackq tokens=*" %%i in ('wsl wslpath -a -u "%CD%\\infra\\ansible\\playbooks\\deploy_env.yml"') do set PLAYBOOK_WSL=%%i
-                            for /f "usebackq tokens=*" %%i in ('wsl wslpath -a -u "%CD%\\infra\\ansible\\.vault_pass.txt"') do set VAULTFILE_WSL=%%i
+                            REM --- Запускаем Docker-контейнер на базе python и устанавливаем ansible через pip, затем запускаем playbook
+                            REM --- Монтируем текущую директорию в /app и используем /work/infra/ansible/ansible.cfg
+                            docker run --rm -v "%cd%":/app -w /app -e ANSIBLE_CONFIG=/work/infra/ansible/ansible.cfg python:3.11-bullseye bash -lc ^
+                                "python -m pip install --upgrade pip setuptools wheel >/dev/null && ^
+                                 pip install ansible >/dev/null && ^
+                                 ansible-playbook infra/ansible/playbooks/deploy_env.yml --vault-password-file infra/ansible/.vault_pass.txt"
 
-                            echo Playbook WSL path: %PLAYBOOK_WSL%
-                            echo Vault file WSL path: %VAULTFILE_WSL%
-
-                            REM --- попытка установить ansible в WSL, если он отсутствует (будет установлен в ~/.local)
-                            wsl bash -lc "if ! command -v ansible-playbook >/dev/null 2>&1; then python3 -m pip install --user ansible; fi"
-
-                            REM --- запускаем ansible-playbook в WSL, расшифровываем и записываем .env
-                            wsl ansible-playbook "%PLAYBOOK_WSL%" --vault-password-file "%VAULTFILE_WSL%"
-
-                            REM --- удаляем временный файл пароля
+                            REM --- Удаляем временный файл пароля
                             del infra\\ansible\\.vault_pass.txt
 
                             endlocal
