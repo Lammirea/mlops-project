@@ -27,30 +27,80 @@ pipeline {
             }
         }
 
-        stage('Decrypt ansible-vault files') {
-            // Делаем расшифровку один раз для всего pipeline (тесты + docker-compose)
+        stage('Decrypt .env via Ansible') {
             steps {
                 dir('mlops_project') {
-                    // Рекомендуемый вариант: используем Secret file (credentialsId = 'ansible-vault-pass-file')
-                    withCredentials([file(credentialsId: 'vault-pass-id', variable: 'VAULT_PASS_FILE')]) {
+                    // ansible_vault_password должен быть добавлен в Jenkins Credentials (type: Secret text)
+                    withCredentials([string(credentialsId: 'ansible_vault_password', variable: 'VAULT_PASS')]) {
                         bat '''
                             chcp 65001
+                            setlocal enabledelayedexpansion
 
-                            REM копируем секретный файл (Jenkins дает путь на агенте) в workspace
-                            copy "%VAULT_PASS_FILE%" vault_pass.txt
+                            REM --- Убедимся, что директория infra/ansible есть (на всякий случай)
+                            if not exist infra\\ansible mkdir infra\\ansible
+                            if not exist infra\\ansible\\playbooks mkdir infra\\ansible\\playbooks
+                            if not exist infra\\ansible\\group_vars mkdir infra\\ansible\\group_vars
+                            if not exist infra\\ansible\\group_vars\\all mkdir infra\\ansible\\group_vars\\all
 
-                            REM создаем скрипт decrypt.sh, который потом выполнится внутри Linux-контейнера
-                            echo #!/bin/bash > decrypt.sh
-                            REM экранируем > в Windows командном интерпретаторе с ^
-                            echo ansible-vault view --vault-password-file vault_pass.txt .env.vault ^> .env >> decrypt.sh
-                            REM сделаем скрипт исполняемым не нужно — запустим через bash
+                            REM --- создаём временный файл с паролем для ansible-vault (не в коммит)
+                            echo %VAULT_PASS% > infra\\ansible\\.vault_pass.txt
 
-                            REM запускаем Linux-контейнер; внутри него ставим ansible-core и выполняем decrypt.sh
-                            docker run --rm -v "%cd%":/app -w /app python:3.11-bullseye bash -lc "pip install --upgrade pip setuptools wheel ansible-core && bash ./decrypt.sh"
+                            REM --- преобразуем Windows-путь в WSL-путь через wslpath
+                            for /f "usebackq tokens=*" %%i in ('wsl wslpath -a -u "%CD%\\infra\\ansible\\playbooks\\deploy_env.yml"') do set PLAYBOOK_WSL=%%i
+                            for /f "usebackq tokens=*" %%i in ('wsl wslpath -a -u "%CD%\\infra\\ansible\\.vault_pass.txt"') do set VAULTFILE_WSL=%%i
 
-                            REM удаляем временные артефакты
-                            del /Q vault_pass.txt || echo no vault_pass.txt
-                            del /Q decrypt.sh || echo no decrypt.sh
+                            echo Playbook WSL path: %PLAYBOOK_WSL%
+                            echo Vault file WSL path: %VAULTFILE_WSL%
+
+                            REM --- попытка установить ansible в WSL, если он отсутствует (будет установлен в ~/.local)
+                            wsl bash -lc "if ! command -v ansible-playbook >/dev/null 2>&1; then python3 -m pip install --user ansible; fi"
+
+                            REM --- запускаем ansible-playbook в WSL, расшифровываем и записываем .env
+                            wsl ansible-playbook "%PLAYBOOK_WSL%" --vault-password-file "%VAULTFILE_WSL%"
+
+                            REM --- удаляем временный файл пароля
+                            del infra\\ansible\\.vault_pass.txt
+
+                            endlocal
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Setup MinIO and DVC') {
+            steps {
+                dir('mlops_project') {
+                    withCredentials([
+                        string(credentialsId: 'minio-access-key', variable: 'MINIO_ACCESS_KEY'),
+                        string(credentialsId: 'minio-secret-key', variable: 'MINIO_SECRET_KEY'),
+                        string(credentialsId: 'minio-endpoint', variable: 'MINIO_ENDPOINT')
+                    ]) {
+                        bat '''
+                            chcp 65001
+                            REM --- создаем .env с параметрами MinIO
+                            echo MINIO_ACCESS_KEY=%MINIO_ACCESS_KEY% >> .env
+                            echo MINIO_SECRET_KEY=%MINIO_SECRET_KEY% >> .env
+                            echo MINIO_ENDPOINT=%MINIO_ENDPOINT% >> .env
+                            echo DVC_REMOTE_NAME=storage >> .env
+                            
+                            REM --- запускаем MinIO и инициализируем DVC
+                            docker-compose up -d minio minio-init
+                            
+                            REM --- ждем пока MinIO запустится
+                            timeout 30
+                            
+                            REM --- устанавливаем DVC и настраиваем remote
+                            docker run --rm -v "%cd%":/app -w /app python:3.11-bullseye bash -lc "
+                            pip install dvc[s3] && \
+                            cd /app && \
+                            dvc init --no-scm && \
+                            dvc remote add -d storage s3://data && \
+                            dvc remote modify storage endpointurl %MINIO_ENDPOINT% && \
+                            dvc remote modify storage access_key_id %MINIO_ACCESS_KEY% && \
+                            dvc remote modify storage secret_access_key %MINIO_SECRET_KEY% && \
+                            echo 'DVC setup completed'
+                            "
                         '''
                     }
                 }
@@ -64,7 +114,7 @@ pipeline {
                     chcp 65001
                     docker run --rm -v "%cd%":/app -w /app python:3.11-bullseye bash -lc " \
                     python -m pip install --upgrade pip setuptools wheel && \
-                    pip install -r requirements.txt coverage pytest --root-user-action=ignore && \
+                    pip install -r requirements.txt coverage pytest dvc[s3] --root-user-action=ignore && \
                     coverage run -m pytest src/unit_tests -q --maxfail=1 --disable-warnings && \
                     coverage xml -i && \
                     coverage html -d coverage_html \
@@ -73,7 +123,6 @@ pipeline {
                 }
             }
         }
-
 
         stage('Login'){
             steps{
@@ -98,7 +147,7 @@ pipeline {
                             ]) {
                                 bat '''
                                     chcp 65001
-                                    REM --- дописываем параметры postgresql в .env (уже расшифрована или создана ранее)
+                                    REM --- дописываем параметры postgresql в .env
                                     echo POSTGRES_HOST=%POSTGRES_HOST% >> .env
                                     echo POSTGRES_PORT=%POSTGRES_PORT% >> .env
                                     echo POSTGRES_DB=%POSTGRES_DB% >> .env
@@ -134,9 +183,7 @@ pipeline {
         stage('Checkout coverage report') {
             steps {
                 dir('mlops_project') {
-                // просто вывести краткую сводку
                 bat 'chcp 65001 && type coverage.xml || echo "coverage.xml not found"'
-                // или лучше: опубликовать html через плагин Publish HTML
                 publishHTML (target: [
                     reportDir: 'coverage_html',
                     reportFiles: 'index.html',
@@ -146,7 +193,6 @@ pipeline {
                 }
             }
         }
-
 
         stage('Push'){
             steps{
@@ -161,10 +207,16 @@ pipeline {
                 chcp 65001
                 docker stop mlops_project-web-1 || exit /b 0
                 docker rm mlops_project-web-1 || exit /b 0
-                docker stop postgres_db || exit /b 0
-                docker rm postgres_db || exit /b 0
+                docker stop postgres || exit /b 0
+                docker rm postgres || exit /b 0
+                docker stop minio || exit /b 0
+                docker rm minio || exit /b 0
+                docker stop mlops_project-minio-init-1 || exit /b 0
+                docker rm mlops_project-minio-init-1 || exit /b 0
                 docker rmi derelia/mlops_project:latest || exit /b 0
                 docker rmi postgres:latest || exit /b 0
+                docker rmi minio/minio:RELEASE.2025-09-07T16-13-09Z || exit /b 0
+                docker rmi minio/mc:RELEASE.2025-09-07T16-13-09Z || exit /b 0
                 docker logout
             '''
             cleanWs()

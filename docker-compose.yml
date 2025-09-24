@@ -38,35 +38,73 @@ services:
       retries: 3
       start_period: 10s
 
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+      - ./data:/data/data:ro # Монтируем папку data внутрь контейнера
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # Сервис для инициализации MinIO и создания бакетов
+  minio-init:
+    image: minio/mc:RELEASE.2025-09-07T16-13-09Z
+    depends_on:
+      - minio
+    command: >
+      /bin/sh -c "
+        sleep 10 &&
+        mc alias set myminio http://minio:9000 minioadmin minioadmin &&
+        mc mb myminio/data --ignore-existing &&
+        mc mb myminio/models --ignore-existing &&
+        mc mb myminio/experiments --ignore-existing &&
+        mc anonymous set public myminio/data &&
+        mc anonymous set public myminio/models &&
+        mc anonymous set public myminio/experiments
+      "
+
   web:
     build: .
     depends_on:
       - kafka
       - postgres
-    command: bash -c "uvicorn src.app:app --host 0.0.0.0 --port 8090 --reload"
+      - minio
+      - minio-init
+    command: |
+      bash -c "
+        dvc remote add -d storage s3://data
+        dvc remote modify storage endpointurl http://minio:9000
+        dvc remote modify storage access_key_id minioadmin
+        dvc remote modify storage secret_access_key minioadmin
+        uvicorn src.app:app --host 0.0.0.0 --port 8090 --reload
+      "
     ports:
       - "8090:8090"
+    env_file: .env
     environment:
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - KAFKA_TOPIC=predictions
-      - POSTGRES_HOST=postgres
-      - POSTGRES_PORT=5432
-      - POSTGRES_DB=ml_predictions
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=devpostgrespass
+      - KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BOOTSTRAP_SERVERS}
+      - KAFKA_TOPIC=${KAFKA_TOPIC}
+      - POSTGRES_HOST=${POSTGRES_HOST}
+      - POSTGRES_PORT=${POSTGRES_PORT}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT}
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
+      - DVC_REMOTE_NAME=${DVC_REMOTE_NAME}
     image: derelia/mlops_project:latest
 
-    minio:
-      image: minio/minio:RELEASE.2025-09-07T16-13-09Z
-      ports:
-        - "9000:9000" # S3 API
-        - "9001:9001" # Console
-      environment:
-        MINIO_ROOT_USER: minioadmin
-        MINIO_ROOT_PASSWORD: minioadmin
-      command: server /data --console-address ":9001"
-      volumes:
-        - minio_data:/data
-
 volumes:
+  postgres-data:
   minio_data:
