@@ -107,21 +107,32 @@ pipeline {
             }
         }
 
-
-
-        stage('Run Unit Tests (in Docker)') {
+        stage('Run Unit Tests (in Docker with MinIO)') {
             steps {
                 dir('mlops-project') {
-                bat '''
-                    chcp 65001
-                    docker run --rm -v "%cd%":/app -w /app python:3.11-bullseye bash -c " \
-                    python -m pip install --upgrade pip setuptools wheel && \
-                    pip install -r requirements.txt coverage pytest dvc[s3] --root-user-action=ignore && \
-                    coverage run -m pytest src/unit_tests -q --maxfail=1 --disable-warnings && \
-                    coverage xml -i && \
-                    coverage html -d coverage_html \
-                    "
-                '''
+                    withCredentials([
+                        string(credentialsId: 'minio-access-key', variable: 'MINIO_ACCESS_KEY'),
+                        string(credentialsId: 'minio-secret-key', variable: 'MINIO_SECRET_KEY'),
+                        string(credentialsId: 'minio-endpoint', variable: 'MINIO_ENDPOINT')
+                    ]) {
+                        bat '''
+                            chcp 65001
+                            REM --- запускаем MinIO для юнит-тестов
+                            docker-compose up -d minio minio-init
+                            
+                            REM --- ждем пока MinIO запустится
+                            timeout /t 30 /nobreak
+                            
+                            REM --- запускаем юнит-тесты в контейнере с подключением к MinIO
+                            docker run --network="host" --rm -v "%cd%":/app -w /app -e MINIO_ENDPOINT=%MINIO_ENDPOINT% -e MINIO_ACCESS_KEY=%MINIO_ACCESS_KEY% -e MINIO_SECRET_KEY=%MINIO_SECRET_KEY% python:3.11-bullseye bash -c " \
+                            python -m pip install --upgrade pip setuptools wheel && \
+                            pip install -r requirements.txt coverage pytest dvc[s3] --root-user-action=ignore && \
+                            coverage run -m pytest src/unit_tests -q --maxfail=1 --disable-warnings && \
+                            coverage xml -i && \
+                            coverage html -d coverage_html \
+                            "
+                        '''
+                    }
                 }
             }
         }
