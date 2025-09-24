@@ -105,7 +105,7 @@ class DataMaker:
                 )
                 # Проверяем доступность бакета
                 client.head_bucket(Bucket=minio_config['bucket_name'])
-                
+
                 self.log.info("MinIO клиент успешно инициализирован")
                 return client
             except Exception as e:
@@ -199,9 +199,9 @@ class DataMaker:
             cfg_dir = os.path.dirname(self.config_path)
 
             # безопасно читаем train_file
-            train_file_val = self.config.get('UTEST_DATA', 'train_file', fallback=None)
+            train_file_val = self.config.get('DATA', 'train_file', fallback=None)
             if train_file_val is None:
-                self.log.error('train_file не задан в секции UTEST_DATA')
+                self.log.error('train_file не задан в секции DATA')
                 return False
             # убираем кавычки и пробелы
             train_file_val = train_file_val.strip().strip('"').strip("'")
