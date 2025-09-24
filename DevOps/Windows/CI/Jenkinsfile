@@ -71,6 +71,16 @@ pipeline {
                     ]) {
                         bat '''
                             chcp 65001
+
+                            REM --- Бэкап и удаление problem config (если он есть)
+                            if exist .dvc\\config (
+                            echo Backing up existing .dvc\\config to .dvc\\config.bak
+                            copy /Y .dvc\\config .dvc\\config.bak
+                            attrib -R .dvc\\config 2>nul || echo attrib failed or not needed
+                            del /F .dvc\\config 2>nul || echo delete failed or file was locked
+                            )
+
+                            REM --- Устанавливаем dvc и выполняем init / remote config в одном контейнере
                             docker run --rm -v "%cd%":/app -w /app -e MINIO_ENDPOINT=%MINIO_ENDPOINT% -e MINIO_ACCESS_KEY=%MINIO_ACCESS_KEY% -e MINIO_SECRET_KEY=%MINIO_SECRET_KEY% python:3.11-bullseye bash -lc " \
                             set -euo pipefail; \
                             echo 'Installing dvc...'; \
@@ -83,7 +93,7 @@ pipeline {
                             else \
                                 echo '.dvc exists — skipping dvc init'; \
                             fi; \
-                            echo 'Adding/ensuring remote "storage"'; \
+                            echo 'Adding/ensuring remote storage'; \
                             dvc remote add -d storage s3://data || true; \
                             dvc remote modify storage endpointurl \"$MINIO_ENDPOINT\"; \
                             dvc remote modify storage access_key_id \"$MINIO_ACCESS_KEY\"; \
@@ -91,6 +101,7 @@ pipeline {
                             echo 'DVC setup completed' \
                             "
                         '''
+
                     }
                 }
             }
