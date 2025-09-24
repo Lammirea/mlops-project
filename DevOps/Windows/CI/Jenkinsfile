@@ -69,39 +69,25 @@ pipeline {
                         string(credentialsId: 'minio-secret-key', variable: 'MINIO_SECRET_KEY'),
                         string(credentialsId: 'minio-endpoint', variable: 'MINIO_ENDPOINT')
                     ]) {
-                        // 1) Создаём/дописываем .env
-                        bat '''
-                            chcp 65001
-                            echo MINIO_ACCESS_KEY=%MINIO_ACCESS_KEY% >> .env
-                            echo MINIO_SECRET_KEY=%MINIO_SECRET_KEY% >> .env
-                            echo MINIO_ENDPOINT=%MINIO_ENDPOINT% >> .env
-                            echo DVC_REMOTE_NAME=storage >> .env
-                        '''
-
-                        // 2) Запускаем minio и init контейнер
-                        bat '''
-                            chcp 65001
-                            docker-compose up -d minio minio-init
-                        '''
-
-                        // 3) Ждём ~30 сек (ping, т.к. timeout может не работать в non-interactive)
-                        bat '''
-                            chcp 65001
-                            ping -n 31 127.0.0.1 >nul
-                        '''
-
-                        // 4) В одном контейнере устанавливаем dvc[s3] и выполняем init + настройку remote
                         bat '''
                             chcp 65001
                             docker run --rm -v "%cd%":/app -w /app -e MINIO_ENDPOINT=%MINIO_ENDPOINT% -e MINIO_ACCESS_KEY=%MINIO_ACCESS_KEY% -e MINIO_SECRET_KEY=%MINIO_SECRET_KEY% python:3.11-bullseye bash -lc " \
-                            python -m pip install --upgrade pip setuptools wheel >/dev/null && \
-                            pip install 'dvc[s3]' --root-user-action=ignore >/dev/null && \
-                            cd /app && \
-                            dvc init --no-scm && \
-                            dvc remote add -d storage s3://data && \
-                            dvc remote modify storage endpointurl \"$MINIO_ENDPOINT\" && \
-                            dvc remote modify storage access_key_id \"$MINIO_ACCESS_KEY\" && \
-                            dvc remote modify storage secret_access_key \"$MINIO_SECRET_KEY\" && \
+                            set -euo pipefail; \
+                            echo 'Installing dvc...'; \
+                            python -m pip install --upgrade pip setuptools wheel >/dev/null; \
+                            pip install 'dvc[s3]' --root-user-action=ignore --no-cache-dir >/dev/null; \
+                            cd /app; \
+                            if [ ! -d .dvc ]; then \
+                                echo '.dvc not found — running dvc init'; \
+                                dvc init --no-scm; \
+                            else \
+                                echo '.dvc exists — skipping dvc init'; \
+                            fi; \
+                            echo 'Adding/ensuring remote "storage"'; \
+                            dvc remote add -d storage s3://data || true; \
+                            dvc remote modify storage endpointurl \"$MINIO_ENDPOINT\"; \
+                            dvc remote modify storage access_key_id \"$MINIO_ACCESS_KEY\"; \
+                            dvc remote modify storage secret_access_key \"$MINIO_SECRET_KEY\"; \
                             echo 'DVC setup completed' \
                             "
                         '''
