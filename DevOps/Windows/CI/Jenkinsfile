@@ -209,8 +209,8 @@ pipeline {
                 docker rm mlops-project-minio-init-1 || exit /b 0
                 docker rmi derelia/mlops-project:latest || exit /b 0
                 docker rmi postgres:latest || exit /b 0
-                docker rmi minio/minio:RELEASE.2025-09-07T16-13-09Z || exit /b 0
-                docker rmi minio/mc:RELEASE.2025-09-07T16-13-09Z || exit /b 0
+                docker rmi minio/minio:latest || exit /b 0
+                docker rmi minio/mc:latest || exit /b 0
                 docker logout
             '''
             cleanWs()
