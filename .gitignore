@@ -5,3 +5,4 @@
 /.pytest_cache
 /.vscode
 /data
+/infra/ansible/.vault_pass.txt
