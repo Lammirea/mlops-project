@@ -1,0 +1,21 @@
+---
+- name: Deploy decrypted .env to project root
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  # Подключаем зашифрованные переменные (vault.yml должен содержать env_content, созданный ранее)
+  vars_files:
+    - "{{ playbook_dir }}/../group_vars/all/vault.yml"
+
+  tasks:
+    - name: Ensure infra/ansible parent directories exist (safety)
+      file:
+        path: "{{ playbook_dir }}/../../"
+        state: directory
+
+    - name: Write .env file from vault to project root (mlops_project/.env)
+      copy:
+        dest: "{{ playbook_dir }}/../../.env"
+        content: "{{ env_content | default('') }}"
+        mode: "0640"
