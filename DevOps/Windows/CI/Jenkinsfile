@@ -46,12 +46,11 @@ pipeline {
                             echo %VAULT_PASS% > infra\\ansible\\.vault_pass.txt
 
                             REM --- Запускаем Docker-контейнер на базе python и устанавливаем ansible через pip, затем запускаем playbook
-                            REM --- Монтируем текущую директорию в /app и используем /work/infra/ansible/ansible.cfg
-                            docker run --rm -v "%cd%":/app -w /app -e ANSIBLE_CONFIG=/work/infra/ansible/ansible.cfg python:3.11-bullseye bash -lc ^
+                            REM --- Монтируем текущую директорию в /app и используем /app/infra/ansible/ansible.cfg
+                            docker run --rm -v "%cd%":/app -w /app -e ANSIBLE_CONFIG=/app/infra/ansible/ansible.cfg python:3.11-bullseye bash -lc ^
                                 "python -m pip install --upgrade pip setuptools wheel >/dev/null && ^
-                                 pip install ansible >/dev/null && ^
-                                 ansible-playbook infra/ansible/playbooks/deploy_env.yml --vault-password-file infra/ansible/.vault_pass.txt"
-
+                                pip install ansible --root-user-action=ignore >/dev/null && ^
+                                ansible-playbook infra/ansible/playbooks/deploy_env.yml --vault-password-file infra/ansible/.vault_pass.txt"
                             REM --- Удаляем временный файл пароля
                             del infra\\ansible\\.vault_pass.txt
 
@@ -70,10 +69,9 @@ pipeline {
                         string(credentialsId: 'minio-secret-key', variable: 'MINIO_SECRET_KEY'),
                         string(credentialsId: 'minio-endpoint', variable: 'MINIO_ENDPOINT')
                     ]) {
-                        // 1) Создаём .env (добавляем MinIO настройки)
+                        // 1) Создаём/дописываем .env
                         bat '''
                             chcp 65001
-                            REM --- создаем .env с параметрами MinIO
                             echo MINIO_ACCESS_KEY=%MINIO_ACCESS_KEY% >> .env
                             echo MINIO_SECRET_KEY=%MINIO_SECRET_KEY% >> .env
                             echo MINIO_ENDPOINT=%MINIO_ENDPOINT% >> .env
@@ -83,44 +81,35 @@ pipeline {
                         // 2) Запускаем minio и init контейнер
                         bat '''
                             chcp 65001
-                            REM --- запускаем MinIO и init
                             docker-compose up -d minio minio-init
                         '''
 
-                        // 3) Ждём старт контейнеров: заменяем timeout (не работает под службой) на ping
+                        // 3) Ждём ~30 сек (ping, т.к. timeout может не работать в non-interactive)
                         bat '''
                             chcp 65001
-                            REM --- Подождать ~30 секунд (ping вместо timeout, чтобы не падало в non-interactive)
                             ping -n 31 127.0.0.1 >nul
                         '''
 
-                        // 4) (опционально/рекомендовано) Проводим проверку, что MinIO слушает порт 9000 внутри сети compose
-                        //    Если нужно — можно заменить на более точный polling по HTTP (curl) или использовать mc client.
+                        // 4) В одном контейнере устанавливаем dvc[s3] и выполняем init + настройку remote
                         bat '''
                             chcp 65001
-                            REM --- Простейшая проверка: убедиться, что контейнер minio запущен
-                            docker ps -a --filter "name=mlops-project-minio-1" --format "table {{.Names}}\\t{{.Status}}"
-                        '''
-
-                        // 5) Устанавливаем dvc и инициализируем (в контейнере python)
-                        bat '''
-                            chcp 65001
-                            docker run --rm -v "%cd%":/app -w /app python:3.11-bullseye bash -lc "python -m pip install --upgrade pip setuptools wheel && pip install dvc[s3]"
-                        '''
-
-                        bat '''
-                            chcp 65001
-                            docker run --rm -v "%cd%":/app -w /app python:3.11-bullseye bash -lc "cd /app && dvc init --no-scm"
-                        '''
-
-                        bat '''
-                            chcp 65001
-                            docker run --rm -v "%cd%":/app -w /app python:3.11-bullseye bash -lc "cd /app && dvc remote add -d storage s3://data && dvc remote modify storage endpointurl %MINIO_ENDPOINT% && dvc remote modify storage access_key_id %MINIO_ACCESS_KEY% && dvc remote modify storage secret_access_key %MINIO_SECRET_KEY% && echo 'DVC setup completed'"
+                            docker run --rm -v "%cd%":/app -w /app -e MINIO_ENDPOINT=%MINIO_ENDPOINT% -e MINIO_ACCESS_KEY=%MINIO_ACCESS_KEY% -e MINIO_SECRET_KEY=%MINIO_SECRET_KEY% python:3.11-bullseye bash -lc " \
+                            python -m pip install --upgrade pip setuptools wheel >/dev/null && \
+                            pip install 'dvc[s3]' --root-user-action=ignore >/dev/null && \
+                            cd /app && \
+                            dvc init --no-scm && \
+                            dvc remote add -d storage s3://data && \
+                            dvc remote modify storage endpointurl \"$MINIO_ENDPOINT\" && \
+                            dvc remote modify storage access_key_id \"$MINIO_ACCESS_KEY\" && \
+                            dvc remote modify storage secret_access_key \"$MINIO_SECRET_KEY\" && \
+                            echo 'DVC setup completed' \
+                            "
                         '''
                     }
                 }
             }
         }
+
 
 
         stage('Run Unit Tests (in Docker)') {

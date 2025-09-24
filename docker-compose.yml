@@ -61,8 +61,8 @@ services:
     image: minio/mc:latest
     depends_on:
       - minio
-    command: >
-      /bin/sh -c "
+    command: |
+      bash -c "
         sleep 10 &&
         mc alias set myminio http://minio:9000 minioadmin minioadmin &&
         mc mb myminio/data --ignore-existing &&
