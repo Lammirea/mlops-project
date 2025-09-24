@@ -6,7 +6,6 @@ from sklearn.metrics import accuracy_score
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.naive_bayes import GaussianNB
-
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
@@ -18,6 +17,9 @@ from src.preprocess import DataMaker
 from src.logger import Logger
 import sys
 import tempfile
+import boto3
+from botocore.client import Config
+import io
 
 SHOW_LOG = True
 IS_TEST_MODE = "pytest" in sys.modules or "unittest" in sys.modules
@@ -45,19 +47,31 @@ class MultiModel:
             self.log.error(error_msg)
             raise FileNotFoundError(error_msg)
         
-        # Загрузка данных из файлов, указанных в config.ini
-        train_path = os.path.normpath(os.path.join(os.getcwd(), self.config["UTEST_DATA"]["train_file"]))
-        if not train_path:
-            self.log.error('train_file не задан в секции UTEST_DATA')
-            return False
+        # Загрузка данных - сначала пробуем из MinIO, потом из локальных файлов
+        self.log.info("Загружаем данные...")
+        
+        # Проверяем, есть ли конфигурация для MinIO
+        minio_config = self._get_minio_config()
+        
+        if minio_config and self._is_minio_available(minio_config):
+            self.log.info("Используем MinIO для загрузки данных")
+            train_df = self._load_data_from_minio(minio_config, "train.csv")
+            test_df = self._load_data_from_minio(minio_config, "friday.csv")
+        else:
+            self.log.info("Используем локальные файлы для загрузки данных")
+            # Загрузка данных из файлов, указанных в config.ini
+            train_path = os.path.normpath(os.path.join(os.getcwd(), self.config["UTEST_DATA"]["train_file"]))
+            if not train_path:
+                self.log.error('train_file не задан в секции UTEST_DATA')
+                return False
 
-        test_path = os.path.normpath(os.path.join(os.getcwd(), self.config["DATA"]["test_file"]))
-        if not test_path:
-            self.log.error('test_file не задан в секции DATA')
-            return False
+            test_path = os.path.normpath(os.path.join(os.getcwd(), self.config["DATA"]["test_file"]))
+            if not test_path:
+                self.log.error('test_file не задан в секции DATA')
+                return False
 
-        train_df = pd.read_csv(train_path, encoding='latin1', low_memory=False)
-        test_df = pd.read_csv(test_path, encoding='latin1', low_memory=False)
+            train_df = pd.read_csv(train_path, encoding='latin1', low_memory=False)
+            test_df = pd.read_csv(test_path, encoding='latin1', low_memory=False)
         
         # Предобработка данных
         data_preproc = DataMaker()
@@ -120,6 +134,68 @@ class MultiModel:
         self.d_tree_path = os.path.join(self.project_path, "d_tree.sav")
         
         self.log.info(f"MultiModel is ready. Models path: {self.project_path}")
+
+    def _get_minio_config(self):
+        """
+        Получает конфигурацию MinIO из переменных окружения
+        """
+        endpoint_url = os.getenv('MINIO_ENDPOINT', 'http://localhost:9000')
+        access_key = os.getenv('MINIO_ACCESS_KEY', 'minioadmin')
+        secret_key = os.getenv('MINIO_SECRET_KEY', 'minioadmin')
+        bucket_name = os.getenv('DVC_REMOTE_NAME', 'data')
+        
+        if endpoint_url and access_key and secret_key:
+            return {
+                'endpoint_url': endpoint_url,
+                'aws_access_key_id': access_key,
+                'aws_secret_access_key': secret_key,
+                'bucket_name': bucket_name
+            }
+        return None
+
+    def _is_minio_available(self, minio_config):
+        """
+        Проверяет доступность MinIO
+        """
+        try:
+            s3_client = boto3.client(
+                's3',
+                endpoint_url=minio_config['endpoint_url'],
+                aws_access_key_id=minio_config['aws_access_key_id'],
+                aws_secret_access_key=minio_config['aws_secret_access_key'],
+                config=Config(signature_version='s3v4'),
+                region_name='us-east-1'
+            )
+            # Проверяем доступность бакета
+            s3_client.head_bucket(Bucket=minio_config['bucket_name'])
+            return True
+        except Exception as e:
+            self.log.warning(f"MinIO недоступен: {e}")
+            return False
+
+    def _load_data_from_minio(self, minio_config, file_key):
+        """
+        Загружает CSV файл из MinIO и возвращает pandas DataFrame
+        """
+        s3_client = boto3.client(
+            's3',
+            endpoint_url=minio_config['endpoint_url'],
+            aws_access_key_id=minio_config['aws_access_key_id'],
+            aws_secret_access_key=minio_config['aws_secret_access_key'],
+            config=Config(signature_version='s3v4'),
+            region_name='us-east-1'
+        )
+        
+        try:
+            # Загрузка файла
+            response = s3_client.get_object(Bucket=minio_config['bucket_name'], Key=file_key)
+            # Читаем данные из потока
+            df = pd.read_csv(io.BytesIO(response['Body'].read()), encoding='latin1', low_memory=False)
+            self.log.info(f"Данные успешно загружены из MinIO: {file_key}")
+            return df
+        except Exception as e:
+            self.log.error(f"Ошибка загрузки данных из MinIO: {e}")
+            raise
 
     def log_reg(self, use_config: bool, solver="lbfgs", max_iter=100, predict=False, save=True):
         if use_config:

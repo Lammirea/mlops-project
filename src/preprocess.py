@@ -4,6 +4,9 @@ import pandas as pd
 import numpy as np
 import sys
 import traceback
+import boto3
+from botocore.client import Config
+import io
 
 from src.logger import Logger
 
@@ -44,6 +47,9 @@ class DataMaker:
             self.log.error(error_msg)
             raise FileNotFoundError(error_msg)
 
+        # Проверяем доступность MinIO и инициализируем клиент
+        self.minio_client = self._initialize_minio_client()
+        
         # Папка проекта для данных (по умолчанию в рабочей директории)
         self.project_path = os.path.join(os.getcwd(), "data")
         # Создадим папку, если её нет
@@ -63,6 +69,94 @@ class DataMaker:
             os.path.join(self.project_path, "preprocessed_test_y.csv")
         ]
         self.log.info("DataMaker is ready")
+
+    def _get_minio_config(self):
+        """
+        Получает конфигурацию MinIO из переменных окружения
+        """
+        endpoint_url = os.getenv('MINIO_ENDPOINT', 'http://localhost:9000')
+        access_key = os.getenv('MINIO_ACCESS_KEY', 'minioadmin')
+        secret_key = os.getenv('MINIO_SECRET_KEY', 'minioadmin')
+        bucket_name = os.getenv('DVC_REMOTE_NAME', 'data')
+        
+        if endpoint_url and access_key and secret_key:
+            return {
+                'endpoint_url': endpoint_url,
+                'aws_access_key_id': access_key,
+                'aws_secret_access_key': secret_key,
+                'bucket_name': bucket_name
+            }
+        return None
+
+    def _initialize_minio_client(self):
+        """
+        Инициализирует клиент MinIO если конфигурация доступна
+        """
+        minio_config = self._get_minio_config()
+        if minio_config:
+            try:
+                client = boto3.client(
+                    's3',
+                    endpoint_url=minio_config['endpoint_url'],
+                    aws_access_key_id=minio_config['aws_access_key_id'],
+                    aws_secret_access_key=minio_config['aws_secret_access_key'],
+                    config=Config(signature_version='s3v4'),
+                    region_name='us-east-1'
+                )
+                # Проверяем доступность бакета
+                client.head_bucket(Bucket=minio_config['bucket_name'])
+                
+                self.log.info("MinIO клиент успешно инициализирован")
+                return client
+            except Exception as e:
+                self.log.warning(f"MinIO недоступен: {e}")
+                return None
+        return None
+
+    def _load_csv_from_minio(self, bucket_name, file_key):
+        """
+        Загружает CSV файл из MinIO и возвращает pandas DataFrame
+        """
+        if not self.minio_client:
+            raise Exception("MinIO клиент не инициализирован")
+        
+        try:
+            # Загрузка файла
+            response = self.minio_client.get_object(Bucket=bucket_name, Key=file_key)
+            # Читаем данные из потока
+            df = pd.read_csv(io.BytesIO(response['Body'].read()), encoding='latin1', low_memory=False)
+            self.log.info(f"Данные успешно загружены из MinIO: {file_key}")
+            return df
+        except Exception as e:
+            self.log.error(f"Ошибка загрузки CSV из MinIO: {e}")
+            raise
+
+    def _save_csv_to_minio(self, df, bucket_name, file_key):
+        """
+        Сохраняет DataFrame в CSV и загружает в MinIO
+        """
+        if not self.minio_client:
+            raise Exception("MinIO клиент не инициализирован")
+        
+        try:
+            # Конвертируем DataFrame в CSV в памяти
+            csv_buffer = io.StringIO()
+            df.to_csv(csv_buffer, index=True)
+            csv_buffer.seek(0)
+            
+            # Загружаем в MinIO
+            csv_bytes = io.BytesIO(csv_buffer.getvalue().encode('utf-8'))
+            self.minio_client.put_object(
+                Bucket=bucket_name,
+                Key=file_key,
+                Body=csv_bytes.getvalue(),
+                ContentType='text/csv'
+            )
+            self.log.info(f"Данные успешно сохранены в MinIO: {file_key}")
+            return True
+        except Exception as e:
+            self.log.error(f"Ошибка сохранения CSV в MinIO: {e}")
+            raise
 
     def preprocess_data(self, df):
         # Удаляем лишние пробелы в названиях столбцов
@@ -112,21 +206,36 @@ class DataMaker:
             # убираем кавычки и пробелы
             train_file_val = train_file_val.strip().strip('"').strip("'")
 
-            if not os.path.isabs(train_file_val):
-                train_file = os.path.normpath(os.path.join(cfg_dir, train_file_val))
+            # Проверяем, доступен ли MinIO
+            minio_config = self._get_minio_config()
+            if self.minio_client and minio_config:
+                # Загружаем данные из MinIO
+                self.log.info("Используем MinIO для загрузки данных")
+                train_df = self._load_csv_from_minio(minio_config['bucket_name'], train_file_val)
             else:
-                train_file = os.path.normpath(train_file_val)
+                # Загружаем из локального файла
+                if not os.path.isabs(train_file_val):
+                    train_file = os.path.normpath(os.path.join(cfg_dir, train_file_val))
+                else:
+                    train_file = os.path.normpath(train_file_val)
 
-            if not os.path.isfile(train_file):
-                self.log.error(f"Train file not found: {train_file}")
-                return False
+                if not os.path.isfile(train_file):
+                    self.log.error(f"Train file not found: {train_file}")
+                    return False
 
-            train_df = pd.read_csv(train_file, encoding='latin1', low_memory=False)
+                train_df = pd.read_csv(train_file, encoding='latin1', low_memory=False)
             
             X_train, y_train = self.preprocess_data(train_df)
+            
             # Сохранение предобработанных обучающих данных
-            X_train.to_csv(self.train_path[0], index=True)
-            y_train.to_csv(self.train_path[1], index=True)
+            if self.minio_client and minio_config:
+                # Сохраняем в MinIO
+                self._save_csv_to_minio(X_train, minio_config['bucket_name'], "preprocessed_train_X.csv")
+                self._save_csv_to_minio(y_train, minio_config['bucket_name'], "preprocessed_train_y.csv")
+            else:
+                # Сохраняем локально
+                X_train.to_csv(self.train_path[0], index=True)
+                y_train.to_csv(self.train_path[1], index=True)
 
             # Загрузка тестовых данных
             test_file_val = self.config.get('DATA', 'test_file', fallback=None)
@@ -136,33 +245,54 @@ class DataMaker:
 
             test_file_val = test_file_val.strip().strip('"').strip("'")
 
-            if not os.path.isabs(test_file_val):
-                test_path = os.path.normpath(os.path.join(cfg_dir, test_file_val))
+            if self.minio_client and minio_config:
+                # Загружаем данные из MinIO
+                test_df = self._load_csv_from_minio(minio_config['bucket_name'], test_file_val)
             else:
-                test_path = os.path.normpath(test_file_val)
+                if not os.path.isabs(test_file_val):
+                    test_path = os.path.normpath(os.path.join(cfg_dir, test_file_val))
+                else:
+                    test_path = os.path.normpath(test_file_val)
 
-            if not os.path.isfile(test_path):
-                self.log.error(f"Test file not found: {test_path}")
-                return False
+                if not os.path.isfile(test_path):
+                    self.log.error(f"Test file not found: {test_path}")
+                    return False
 
-            test_df = pd.read_csv(test_path, encoding='latin1', low_memory=False)
+                test_df = pd.read_csv(test_path, encoding='latin1', low_memory=False)
+            
             X_test, y_test = self.preprocess_data(test_df)
 
             # Сохранение предобработанных тестовых данных
-            X_test.to_csv(self.test_path[0], index=True)
-            y_test.to_csv(self.test_path[1], index=True)
+            if self.minio_client and minio_config:
+                # Сохраняем в MinIO
+                self._save_csv_to_minio(X_test, minio_config['bucket_name'], "preprocessed_test_X.csv")
+                self._save_csv_to_minio(y_test, minio_config['bucket_name'], "preprocessed_test_y.csv")
+            else:
+                # Сохраняем локально
+                X_test.to_csv(self.test_path[0], index=True)
+                y_test.to_csv(self.test_path[1], index=True)
 
             self.log.info("X and y data is ready")
-            self.config['PREPROCESSED_DATA'] = {
-                'X_train': self.train_path[0],
-                'y_train': self.train_path[1],
-                'X_test': self.test_path[0],
-                'y_test': self.test_path[1]
-            }
-            return os.path.isfile(self.train_path[0]) and \
-                   os.path.isfile(self.train_path[1]) and \
-                   os.path.isfile(self.test_path[0]) and \
-                   os.path.isfile(self.test_path[1])
+            
+            # Обновляем конфигурацию
+            if self.minio_client and minio_config:
+                # Если используем MinIO, сохраняем пути к MinIO
+                self.config['PREPROCESSED_DATA'] = {
+                    'X_train': f"minio://{minio_config['bucket_name']}/preprocessed_train_X.csv",
+                    'y_train': f"minio://{minio_config['bucket_name']}/preprocessed_train_y.csv",
+                    'X_test': f"minio://{minio_config['bucket_name']}/preprocessed_test_X.csv",
+                    'y_test': f"minio://{minio_config['bucket_name']}/preprocessed_test_y.csv"
+                }
+            else:
+                # Если используем локальные файлы
+                self.config['PREPROCESSED_DATA'] = {
+                    'X_train': self.train_path[0],
+                    'y_train': self.train_path[1],
+                    'X_test': self.test_path[0],
+                    'y_test': self.test_path[1]
+                }
+            
+            return True  # Все данные успешно обработаны
         except FileNotFoundError:
             self.log.error(traceback.format_exc())
             return False
@@ -179,12 +309,23 @@ class DataMaker:
             # не делаем sys.exit в библиотечном коде — вернём False, чтобы тесты могли обработать ошибку
             return False
 
-        self.config['PREPROCESSED_DATA'] = {
-            'X_train': self.train_path[0],
-            'y_train': self.train_path[1],
-            'X_test': self.test_path[0],
-            'y_test': self.test_path[1]
-        }
+        # Обновляем конфигурацию
+        minio_config = self._get_minio_config()
+        if self.minio_client and minio_config:
+            self.config['PREPROCESSED_DATA'] = {
+                'X_train': f"minio://{minio_config['bucket_name']}/preprocessed_train_X.csv",
+                'y_train': f"minio://{minio_config['bucket_name']}/preprocessed_train_y.csv",
+                'X_test': f"minio://{minio_config['bucket_name']}/preprocessed_test_X.csv",
+                'y_test': f"minio://{minio_config['bucket_name']}/preprocessed_test_y.csv"
+            }
+        else:
+            self.config['PREPROCESSED_DATA'] = {
+                'X_train': self.train_path[0],
+                'y_train': self.train_path[1],
+                'X_test': self.test_path[0],
+                'y_test': self.test_path[1]
+            }
+        
         self.log.info("Train and test data is ready")
 
         # Запишем обновлённый конфиг в тот же файл, откуда читали
@@ -194,23 +335,40 @@ class DataMaker:
         except Exception:
             self.log.warning(f"Не удалось записать конфиг по пути {self.config_path}")
 
-        return os.path.isfile(self.train_path[0]) and \
-               os.path.isfile(self.train_path[1]) and \
-               os.path.isfile(self.test_path[0]) and \
-               os.path.isfile(self.test_path[1])
+        return True
 
     def save_splitted_data(self, df: pd.DataFrame, path: str) -> bool:
         df = df.reset_index(drop=True)
-        # Убедимся, что директория для путьa существует
-        dirn = os.path.dirname(path)
-        if dirn:
+        
+        # Проверяем, является ли путь MinIO-путем
+        if path.startswith("minio://"):
             try:
-                os.makedirs(dirn, exist_ok=True)
-            except Exception:
-                pass
-        df.to_csv(path, index=True)
-        self.log.info(f'{path} is saved')
-        return os.path.isfile(path)
+                # Извлекаем bucket_name и file_key из пути
+                parts = path.replace("minio://", "").split("/", 1)
+                if len(parts) != 2:
+                    raise ValueError(f"Неверный формат MinIO пути: {path}")
+                
+                bucket_name, file_key = parts
+                
+                # Сохраняем в MinIO
+                if self.minio_client:
+                    return self._save_csv_to_minio(df, bucket_name, file_key)
+                else:
+                    raise Exception("MinIO клиент не инициализирован")
+            except Exception as e:
+                self.log.error(f"Ошибка сохранения в MinIO: {e}")
+                return False
+        else:
+            # Убедимся, что директория для пути существует
+            dirn = os.path.dirname(path)
+            if dirn:
+                try:
+                    os.makedirs(dirn, exist_ok=True)
+                except Exception:
+                    pass
+            df.to_csv(path, index=True)
+            self.log.info(f'{path} is saved')
+            return os.path.isfile(path)
 
 
 if __name__ == "__main__":

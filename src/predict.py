@@ -17,6 +17,9 @@ import numpy as np
 import warnings
 import psycopg2
 from psycopg2 import sql
+import boto3
+from botocore.client import Config
+import io
 from src.preprocess import DataMaker
 
 warnings.filterwarnings("ignore")
@@ -49,6 +52,9 @@ class Predictor:
             self.log.error("Configuration file config.ini not found in expected locations.")
             raise FileNotFoundError("config.ini not found")
 
+        # Инициализируем MinIO клиент
+        self.minio_client = self._initialize_minio_client()
+
         # Парсер аргументов
         self.parser = argparse.ArgumentParser(description="Predictor")
         self.parser.add_argument("-m", "--model", type=str, help="Select model", required=True,
@@ -60,15 +66,15 @@ class Predictor:
 
         # Загрузка данных согласно конфигу (ожидаем секцию DATA с train_file/test_file)
         try:
-            train_path = os.path.normpath(os.path.join(os.getcwd(), self.config["DATA"]["train_file"]))
-            test_path = os.path.normpath(os.path.join(os.getcwd(), self.config["DATA"]["test_file"]))
+            train_file_path = self.config["DATA"]["train_file"]
+            test_file_path = self.config["DATA"]["test_file"]
         except KeyError as e:
             self.log.error(f"Missing DATA.train_file or DATA.test_file in config.ini: {e}")
             raise
 
-        # Загружаем DataFrame'ы
-        train_df = pd.read_csv(train_path, encoding='latin1', low_memory=False)
-        test_df = pd.read_csv(test_path, encoding='latin1', low_memory=False)
+        # Загружаем DataFrame'ы - сначала пробуем из MinIO, потом локально
+        train_df = self._load_dataframe(train_file_path)
+        test_df = self._load_dataframe(test_file_path)
 
         # Предобработка
         preprocess_data = DataMaker()
@@ -97,6 +103,87 @@ class Predictor:
 
         self.log.info("Predictor is ready")
 
+    def _get_minio_config(self):
+        """
+        Получает конфигурацию MinIO из переменных окружения
+        """
+        endpoint_url = os.getenv('MINIO_ENDPOINT', 'http://localhost:9000')
+        access_key = os.getenv('MINIO_ACCESS_KEY', 'minioadmin')
+        secret_key = os.getenv('MINIO_SECRET_KEY', 'minioadmin')
+        bucket_name = os.getenv('DVC_REMOTE_NAME', 'data')
+        
+        if endpoint_url and access_key and secret_key:
+            return {
+                'endpoint_url': endpoint_url,
+                'aws_access_key_id': access_key,
+                'aws_secret_access_key': secret_key,
+                'bucket_name': bucket_name
+            }
+        return None
+
+    def _initialize_minio_client(self):
+        """
+        Инициализирует клиент MinIO если конфигурация доступна
+        """
+        minio_config = self._get_minio_config()
+        if minio_config:
+            try:
+                client = boto3.client(
+                    's3',
+                    endpoint_url=minio_config['endpoint_url'],
+                    aws_access_key_id=minio_config['aws_access_key_id'],
+                    aws_secret_access_key=minio_config['aws_secret_access_key'],
+                    config=Config(signature_version='s3v4'),
+                    region_name='us-east-1'
+                )
+                # Проверяем доступность бакета
+                client.head_bucket(Bucket=minio_config['bucket_name'])
+                self.log.info("MinIO клиент успешно инициализирован")
+                return client
+            except Exception as e:
+                self.log.warning(f"MinIO недоступен: {e}")
+                return None
+        return None
+
+    def _load_dataframe(self, file_path):
+        """
+        Загружает DataFrame из MinIO или локального файла
+        """
+        minio_config = self._get_minio_config()
+        
+        # Проверяем, является ли путь MinIO-путем или содержит ли он имя бакета
+        if self.minio_client and minio_config and not file_path.startswith('http') and not os.path.isabs(file_path):
+            # Считаем, что это имя файла в бакете
+            try:
+                self.log.info(f"Загружаем данные из MinIO: {file_path}")
+                df = self._load_csv_from_minio(minio_config['bucket_name'], file_path)
+                return df
+            except Exception as e:
+                self.log.warning(f"Ошибка загрузки из MinIO: {e}. Используем локальный файл.")
+        
+        # Загружаем из локального файла
+        self.log.info(f"Загружаем данные из локального файла: {file_path}")
+        local_path = os.path.normpath(os.path.join(os.getcwd(), file_path))
+        return pd.read_csv(local_path, encoding='latin1', low_memory=False)
+
+    def _load_csv_from_minio(self, bucket_name, file_key):
+        """
+        Загружает CSV файл из MinIO и возвращает pandas DataFrame
+        """
+        if not self.minio_client:
+            raise Exception("MinIO клиент не инициализирован")
+        
+        try:
+            # Загрузка файла
+            response = self.minio_client.get_object(Bucket=bucket_name, Key=file_key)
+            # Читаем данные из потока
+            df = pd.read_csv(io.BytesIO(response['Body'].read()), encoding='latin1', low_memory=False)
+            self.log.info(f"Данные успешно загружены из MinIO: {file_key}")
+            return df
+        except Exception as e:
+            self.log.error(f"Ошибка загрузки CSV из MinIO: {e}")
+            raise
+
     def predict(self):
         args = self.parser.parse_args()
         # Загрузка модели из конфига по имени модели
@@ -106,15 +193,26 @@ class Predictor:
             self.log.error(f"Model {args.model} not found in config.ini")
             sys.exit(1)
 
-        try:
-            with open(model_path, "rb") as f:
-                classifier = pickle.load(f)
-        except FileNotFoundError:
-            self.log.error(f"Model file not found: {model_path}")
-            sys.exit(1)
-        except Exception:
-            self.log.error("Failed to load model: " + traceback.format_exc())
-            sys.exit(1)
+        # Проверяем, является ли путь к модели MinIO-путем
+        if model_path.startswith("minio://"):
+            # Загружаем модель из MinIO
+            try:
+                model = self._load_model_from_minio(model_path)
+                classifier = model
+            except Exception as e:
+                self.log.error(f"Failed to load model from MinIO: {e}")
+                sys.exit(1)
+        else:
+            # Загружаем модель из локального файла
+            try:
+                with open(model_path, "rb") as f:
+                    classifier = pickle.load(f)
+            except FileNotFoundError:
+                self.log.error(f"Model file not found: {model_path}")
+                sys.exit(1)
+            except Exception:
+                self.log.error("Failed to load model: " + traceback.format_exc())
+                sys.exit(1)
 
         if args.tests == "smoke":
             try:
@@ -165,7 +263,14 @@ class Predictor:
                         # лог-файл может отсутствовать — игнорируем
                         self.log.warning("Could not copy logfile.log to experiment dir")
                     try:
-                        shutil.copy(model_path, os.path.join(exp_dir, f'exp_{args.model}.sav'))
+                        # Если модель была загружена из MinIO, копируем её в эксперимент
+                        if model_path.startswith("minio://"):
+                            # Загружаем модель из MinIO и сохраняем локально
+                            model = self._load_model_from_minio(model_path)
+                            with open(os.path.join(exp_dir, f'exp_{args.model}.sav'), 'wb') as f:
+                                pickle.dump(model, f)
+                        else:
+                            shutil.copy(model_path, os.path.join(exp_dir, f'exp_{args.model}.sav'))
                     except Exception:
                         self.log.warning("Could not copy model to experiment dir")
 
@@ -255,6 +360,31 @@ class Predictor:
                 self._save_predictions_locally(predictions)
 
         return True
+
+    def _load_model_from_minio(self, minio_path):
+        """
+        Загружает модель из MinIO
+        """
+        if not self.minio_client:
+            raise Exception("MinIO клиент не инициализирован")
+        
+        try:
+            # Извлекаем bucket_name и file_key из пути
+            parts = minio_path.replace("minio://", "").split("/", 1)
+            if len(parts) != 2:
+                raise ValueError(f"Неверный формат MinIO пути: {minio_path}")
+            
+            bucket_name, file_key = parts
+            
+            # Загрузка файла
+            response = self.minio_client.get_object(Bucket=bucket_name, Key=file_key)
+            model_bytes = response['Body'].read()
+            model = pickle.loads(model_bytes)
+            self.log.info(f"Модель успешно загружена из MinIO: {file_key}")
+            return model
+        except Exception as e:
+            self.log.error(f"Ошибка загрузки модели из MinIO: {e}")
+            raise
 
     def _save_predictions_locally(self, predictions):
         # Сохраняем предсказания в файл как fallback, чтобы не терять результат
