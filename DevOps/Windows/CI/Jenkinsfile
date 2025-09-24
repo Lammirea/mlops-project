@@ -70,6 +70,7 @@ pipeline {
                         string(credentialsId: 'minio-secret-key', variable: 'MINIO_SECRET_KEY'),
                         string(credentialsId: 'minio-endpoint', variable: 'MINIO_ENDPOINT')
                     ]) {
+                        // 1) Создаём .env (добавляем MinIO настройки)
                         bat '''
                             chcp 65001
                             REM --- создаем .env с параметрами MinIO
@@ -77,35 +78,50 @@ pipeline {
                             echo MINIO_SECRET_KEY=%MINIO_SECRET_KEY% >> .env
                             echo MINIO_ENDPOINT=%MINIO_ENDPOINT% >> .env
                             echo DVC_REMOTE_NAME=storage >> .env
-                            
-                            REM --- запускаем MinIO и инициализируем DVC
+                        '''
+
+                        // 2) Запускаем minio и init контейнер
+                        bat '''
+                            chcp 65001
+                            REM --- запускаем MinIO и init
                             docker-compose up -d minio minio-init
-                            
-                            REM --- ждем пока MinIO запустится (ожидаем 30 секунд)
-                            timeout /t 30 /nobreak
                         '''
-                        
-                        // Отдельный шаг для установки DVC
+
+                        // 3) Ждём старт контейнеров: заменяем timeout (не работает под службой) на ping
                         bat '''
                             chcp 65001
-                            docker run --rm -v "%cd%":/app -w /app python:3.11-bullseye bash -c "pip install --upgrade pip setuptools wheel && pip install dvc[s3]"
+                            REM --- Подождать ~30 секунд (ping вместо timeout, чтобы не падало в non-interactive)
+                            ping -n 31 127.0.0.1 >nul
                         '''
-                        
-                        // Отдельный шаг для инициализации DVC
+
+                        // 4) (опционально/рекомендовано) Проводим проверку, что MinIO слушает порт 9000 внутри сети compose
+                        //    Если нужно — можно заменить на более точный polling по HTTP (curl) или использовать mc client.
                         bat '''
                             chcp 65001
-                            docker run --rm -v "%cd%":/app -w /app python:3.11-bullseye bash -c "cd /app && dvc init --no-scm"
+                            REM --- Простейшая проверка: убедиться, что контейнер minio запущен
+                            docker ps -a --filter "name=mlops-project-minio-1" --format "table {{.Names}}\\t{{.Status}}"
                         '''
-                        
-                        // Отдельный шаг для настройки remote
+
+                        // 5) Устанавливаем dvc и инициализируем (в контейнере python)
                         bat '''
                             chcp 65001
-                            docker run --rm -v "%cd%":/app -w /app python:3.11-bullseye bash -c "dvc remote add -d storage s3://data && dvc remote modify storage endpointurl %MINIO_ENDPOINT% && dvc remote modify storage access_key_id %MINIO_ACCESS_KEY% && dvc remote modify storage secret_access_key %MINIO_SECRET_KEY% && echo 'DVC setup completed'"
+                            docker run --rm -v "%cd%":/app -w /app python:3.11-bullseye bash -lc "python -m pip install --upgrade pip setuptools wheel && pip install dvc[s3]"
+                        '''
+
+                        bat '''
+                            chcp 65001
+                            docker run --rm -v "%cd%":/app -w /app python:3.11-bullseye bash -lc "cd /app && dvc init --no-scm"
+                        '''
+
+                        bat '''
+                            chcp 65001
+                            docker run --rm -v "%cd%":/app -w /app python:3.11-bullseye bash -lc "cd /app && dvc remote add -d storage s3://data && dvc remote modify storage endpointurl %MINIO_ENDPOINT% && dvc remote modify storage access_key_id %MINIO_ACCESS_KEY% && dvc remote modify storage secret_access_key %MINIO_SECRET_KEY% && echo 'DVC setup completed'"
                         '''
                     }
                 }
             }
         }
+
 
         stage('Run Unit Tests (in Docker)') {
             steps {
