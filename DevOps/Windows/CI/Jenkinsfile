@@ -23,13 +23,13 @@ pipeline {
 
         stage('Checkout repo dir') {
             steps {
-                bat 'chcp 65001 && cd mlops_project && dir'
+                bat 'chcp 65001 && cd mlops-project && dir'
             }
         }
 
         stage('Decrypt .env via Ansible') {
             steps {
-                dir('mlops_project') {
+                dir('mlops-project') {
                     // ansible_vault_password должен быть добавлен в Jenkins Credentials (type: Secret text)
                     withCredentials([string(credentialsId: 'ansible_vault_password', variable: 'VAULT_PASS')]) {
                         bat '''
@@ -70,7 +70,7 @@ pipeline {
 
         stage('Setup MinIO and DVC') {
             steps {
-                dir('mlops_project') {
+                dir('mlops-project') {
                     withCredentials([
                         string(credentialsId: 'minio-access-key', variable: 'MINIO_ACCESS_KEY'),
                         string(credentialsId: 'minio-secret-key', variable: 'MINIO_SECRET_KEY'),
@@ -109,7 +109,7 @@ pipeline {
 
         stage('Run Unit Tests (in Docker)') {
             steps {
-                dir('mlops_project') {
+                dir('mlops-project') {
                 bat '''
                     chcp 65001
                     docker run --rm -v "%cd%":/app -w /app python:3.11-bullseye bash -lc " \
@@ -137,7 +137,7 @@ pipeline {
                         bat 'chcp 65001 && cd mlops_project && docker-compose build'
                     }
                     finally {
-                        dir('mlops_project') {
+                        dir('mlops-project') {
                             withCredentials([
                                 string(credentialsId: 'postgres-password', variable: 'POSTGRES_PASSWORD'),
                                 string(credentialsId: 'postgres-host', variable: 'POSTGRES_HOST'),
@@ -164,10 +164,10 @@ pipeline {
 
         stage('Checkout container logs') {
             steps {
-                dir("mlops_project") {
+                dir("mlops-project") {
                     bat '''
                         docker-compose up -d
-                        for /f %%i in ('docker ps -qf "name=^mlops_project-web-1"') do set containerId=%%i
+                        for /f %%i in ('docker ps -qf "name=^mlops-project-web-1"') do set containerId=%%i
                         echo %containerId%
                         IF "%containerId%" == "" (
                             echo "No container running"
@@ -182,7 +182,7 @@ pipeline {
 
         stage('Checkout coverage report') {
             steps {
-                dir('mlops_project') {
+                dir('mlops-project') {
                 bat 'chcp 65001 && type coverage.xml || echo "coverage.xml not found"'
                 publishHTML (target: [
                     reportDir: 'coverage_html',
@@ -196,7 +196,7 @@ pipeline {
 
         stage('Push'){
             steps{
-                bat 'chcp 65001 && docker push derelia/mlops_project:latest'
+                bat 'chcp 65001 && docker push derelia/mlops-project:latest'
             }
         }
     }
@@ -205,15 +205,15 @@ pipeline {
         always {
             bat '''
                 chcp 65001
-                docker stop mlops_project-web-1 || exit /b 0
-                docker rm mlops_project-web-1 || exit /b 0
+                docker stop mlops-project-web-1 || exit /b 0
+                docker rm mlops-project-web-1 || exit /b 0
                 docker stop postgres || exit /b 0
                 docker rm postgres || exit /b 0
                 docker stop minio || exit /b 0
                 docker rm minio || exit /b 0
-                docker stop mlops_project-minio-init-1 || exit /b 0
-                docker rm mlops_project-minio-init-1 || exit /b 0
-                docker rmi derelia/mlops_project:latest || exit /b 0
+                docker stop mlops-project-minio-init-1 || exit /b 0
+                docker rm mlops-project-minio-init-1 || exit /b 0
+                docker rmi derelia/mlops-project:latest || exit /b 0
                 docker rmi postgres:latest || exit /b 0
                 docker rmi minio/minio:RELEASE.2025-09-07T16-13-09Z || exit /b 0
                 docker rmi minio/mc:RELEASE.2025-09-07T16-13-09Z || exit /b 0
