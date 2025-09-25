@@ -3,52 +3,65 @@ import os
 import json
 import threading
 import time
-from typing import Callable
+from typing import Callable, Optional
+
 from kafka import KafkaConsumer
 from kafka.errors import NoBrokersAvailable
-from src.secret import get_postgres_config
-import psycopg2
+import sys
 
-KAFKA_BOOTSTRAP = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'kafka:9092')
-TOPIC = os.getenv('KAFKA_TOPIC', 'predictions')
-GROUP_ID = os.getenv('KAFKA_CONSUMER_GROUP', 'model-consumers')
+import sys
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from src.pg_conn import get_engine, Base, InferenceResult
+from sqlalchemy.orm import sessionmaker
+
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
+TOPIC = os.getenv("KAFKA_TOPIC", "send_prediction")
+GROUP_ID = os.getenv("KAFKA_CONSUMER_GROUP", "model_consumer_group")
 
 _stop = threading.Event()
 
+# Инициализация БД (создание таблиц при старте модуля)
+engine = get_engine()
+Base.metadata.create_all(engine)
+Session = sessionmaker(bind=engine)
+
+
 def default_handler(msg: dict):
-    print("Consumed:", msg)
-    cfg = get_postgres_config()
+    """
+    msg ожидается в формате похожем на code2: {"input": ..., "prediction": ...}
+    Но если структура другая — сохраняем input_data как json всего сообщения.
+    """
+    session = Session()
     try:
-        conn = psycopg2.connect(
-            host=cfg['POSTGRES_HOST'],
-            port=int(cfg['POSTGRES_PORT']),
-            database=cfg['POSTGRES_DB'],
-            user=cfg['POSTGRES_USER'],
-            password=cfg['POSTGRES_PASSWORD']
+        # Попробуем получить поля как в code2, иначе сохраняем весь объект как input
+        input_part = msg.get("input", msg)
+        prediction_raw = msg.get("prediction")
+
+        input_json = json.dumps(input_part, default=str, ensure_ascii=False)
+        prediction_val: Optional[float] = None
+        if prediction_raw is not None:
+            try:
+                prediction_val = float(prediction_raw)
+            except (ValueError, TypeError):
+                # если не удалось привести к float — сохраняем None и логируем
+                print(f"Warning: prediction value can't be converted to float: {prediction_raw}")
+
+        record = InferenceResult(
+            input_data=input_json,
+            prediction=prediction_val
         )
-        cursor = conn.cursor()
-        create_table_query = """
-        CREATE TABLE IF NOT EXISTS kafka_predictions (
-            id SERIAL PRIMARY KEY,
-            request_id VARCHAR(255),
-            prediction_data TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-        cursor.execute(create_table_query)
-        request_id = str(msg.get('meta', {}).get('request_id', time.time()))
-        prediction_data = json.dumps(msg, default=str, ensure_ascii=False)
-        insert_query = """
-        INSERT INTO kafka_predictions (request_id, prediction_data) 
-        VALUES (%s, %s)
-        """
-        cursor.execute(insert_query, (request_id, prediction_data))
-        conn.commit()
-        cursor.close()
-        conn.close()
-        print(f"Prediction saved to PostgreSQL with request_id: {request_id}")
+        session.add(record)
+        session.commit()
+        print(f"Saved to DB: id={record.id}, prediction={record.prediction}")
     except Exception as e:
-        print(f"Error saving to PostgreSQL: {e}")
+        session.rollback()
+        print("Error saving record to DB:", e)
+    finally:
+        session.close()
+
 
 def _make_consumer_with_retry():
     backoff = 1.0
@@ -57,12 +70,12 @@ def _make_consumer_with_retry():
         try:
             consumer = KafkaConsumer(
                 TOPIC,
-                bootstrap_servers=KAFKA_BOOTSTRAP,
+                bootstrap_servers=[KAFKA_BOOTSTRAP],
                 group_id=GROUP_ID,
                 auto_offset_reset='earliest',
                 enable_auto_commit=True,
                 value_deserializer=lambda m: json.loads(m.decode('utf-8')),
-                consumer_timeout_ms=1000
+                consumer_timeout_ms=1000,
             )
             print("Connected to Kafka broker(s) at", KAFKA_BOOTSTRAP)
             return consumer
@@ -76,16 +89,15 @@ def _make_consumer_with_retry():
             backoff = min(max_backoff, backoff * 2)
     raise RuntimeError("Stop requested before Kafka consumer could be created")
 
+
 def loop(handler: Callable[[dict], None] = default_handler):
     """
-    Blocking loop: поддерживает переподключение при падении/broker недоступен.
-    Используйте этот блокирующий loop в отдельном процессе/контейнере.
+    Блокирующий loop с переподключением. Запускайте в отдельном процессе/потоке.
     """
     while not _stop.is_set():
         consumer = None
         try:
             consumer = _make_consumer_with_retry()
-            # Основной цикл чтения
             for rec in consumer:
                 if _stop.is_set():
                     break
@@ -95,7 +107,6 @@ def loop(handler: Callable[[dict], None] = default_handler):
                     handler(rec.value)
                 except Exception as e:
                     print("Handler error:", e)
-            # Если цикл for завершился (например, consumer timed out), просто продолжим и перезапустим
         except Exception as e:
             print("Unexpected error in consumer loop:", e)
             time.sleep(2)
@@ -105,13 +116,20 @@ def loop(handler: Callable[[dict], None] = default_handler):
                     consumer.close()
             except Exception:
                 pass
-        # небольшая пауза перед попыткой пересоздать consumer
         time.sleep(1)
+
 
 def start_in_thread(handler: Callable[[dict], None] = default_handler):
     t = threading.Thread(target=loop, args=(handler,), daemon=True)
     t.start()
     return t
 
+
 def stop():
     _stop.set()
+
+if __name__ == "__main__":
+    try:
+        loop()
+    except KeyboardInterrupt:
+        stop()

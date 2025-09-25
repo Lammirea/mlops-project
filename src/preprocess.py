@@ -8,7 +8,7 @@ import boto3
 from botocore.client import Config
 import io
 
-from src.logger import Logger
+from logger import Logger
 
 SHOW_LOG = True
 
@@ -165,7 +165,7 @@ class DataMaker:
         # Столбцы, которые хотим удалить (если есть)
         columns_to_drop_cat = ['Flow ID', 'Source IP', 'Destination IP', 'Timestamp', 'Label']
         columns_to_drop = [
-            'Total Fwd Packets', 'Flow IAT Mean', 'Fwd Packet Length Std', 'Bwd IAT Mean',
+            'id','Total Fwd Packets', 'Flow IAT Mean', 'Fwd Packet Length Std', 'Bwd IAT Mean',
             'Bwd IAT Max', 'Fwd IAT Total', 'Active Max', 'Fwd IAT Min',
             'Fwd IAT Mean', 'Bwd IAT Std', 'Bwd IAT Total', 'Fwd PSH Flags', 'FIN Flag Count',
             'Active Min', 'Down/Up Ratio', 'Bwd IAT Min', 'Active Std', 'Fwd Packet Length Min',

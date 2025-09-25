@@ -11,8 +11,8 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-from logger import Logger
-from preprocess import DataMaker
+from src.logger import Logger
+from src.preprocess import DataMaker
 
 SHOW_LOG = True
 

@@ -15,7 +15,7 @@ if os.path.exists(config_path):
 else:
     raise FileNotFoundError(f"Ошибка: файл {config_path} не найден")
 
-from train import MultiModel
+from src.train import MultiModel
 
 # Сделать так, чтобы для unit тестов загружались данные из папки unit_tests/data_for_tests
 class TestTrainModels(unittest.TestCase):

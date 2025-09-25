@@ -13,6 +13,11 @@ from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from imblearn.over_sampling import SMOTE
 
+import sys
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 from src.preprocess import DataMaker
 from src.logger import Logger
 import sys
@@ -55,7 +60,7 @@ class MultiModel:
         
         if minio_config and self._is_minio_available(minio_config):
             self.log.info("Используем MinIO для загрузки данных")
-            train_df = self._load_data_from_minio(minio_config, "train.csv")
+            train_df = self._load_data_from_minio(minio_config, "tuesday.csv")
             test_df = self._load_data_from_minio(minio_config, "friday.csv")
         else:
             self.log.info("Используем локальные файлы для загрузки данных")

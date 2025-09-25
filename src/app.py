@@ -1,184 +1,163 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
-import uvicorn
+# src/main_app.py
 import os
-import configparser
 import json
-import psycopg2
-from psycopg2 import sql
-from src.train import MultiModel
-from src.predict import Predictor
+import configparser
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.encoders import jsonable_encoder
-from src.logger import Logger
-from src.kafka_producer import send_prediction
-from src.secret import get_postgres_config
-from src.kafka_consumer import start_in_thread as start_kafka_consumer, stop as stop_kafka_consumer
-
 from contextlib import asynccontextmanager
 
+import sys
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from src.train import MultiModel
+from src.predict import Predictor
+from src.logger import Logger
+from src.kafka_producer import send_message
+from src.kafka_consumer import start_in_thread as start_kafka_consumer, stop as stop_kafka_consumer
+
+# pg_conn provides SQLAlchemy engine, session and model
+from src.pg_conn import get_engine, get_session, init_db, InferenceResult
+
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+
+# Конфигурация
+KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "send_prediction")
+
+# Логгер
 custom_logger_instance = Logger(show=True)
 logger = custom_logger_instance.get_logger("AppLogger")
 
-pg_connection = None
+# Глобальные ресурсы приложения (устанавливаются в lifespan)
+engine = None
 consumer_thread = None
 
-def create_postgres_connection_from_config():
-    """
-    Создаём postgresql соединение на основе get_postgres_config().
-    Возвращаем объект psycopg2.connection или None (если подключение не удалось).
-    """
-    cfg = get_postgres_config()
-    host = cfg.get('POSTGRES_HOST', 'localhost')
-    port = int(cfg.get('POSTGRES_PORT', 5432) or 5432)
-    database = cfg.get('POSTGRES_DB', 'postgres')
-    user = cfg.get('POSTGRES_USER', 'postgres')
-    password = cfg.get('POSTGRES_PASSWORD', None)
-
-    try:
-        conn = psycopg2.connect(
-            host=host,
-            port=port,
-            database=database,
-            user=user,
-            password=password
-        )
-        # проверка подключения
-        conn.cursor().execute("SELECT 1")
-        logger.info(f"Connected to PostgreSQL at {host}:{port} db={database}")
-        return conn
-    except Exception as e:
-        logger.warning(f"PostgreSQL not available at startup (best-effort): {e}")
-        return None
-
-def init_cache_table():
-    """
-    Создаём таблицу для кэширования результатов, если её нет
-    """
-    if pg_connection is None:
-        return
-    
-    try:
-        cursor = pg_connection.cursor()
-        create_table_query = """
-        CREATE TABLE IF NOT EXISTS prediction_cache (
-            id SERIAL PRIMARY KEY,
-            cache_key VARCHAR(255) UNIQUE,
-            cache_value TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            expires_at TIMESTAMP
-        )
-        """
-        cursor.execute(create_table_query)
-        pg_connection.commit()
-        cursor.close()
-        logger.info("Cache table initialized successfully")
-    except Exception as e:
-        logger.warning(f"Failed to initialize cache table: {e}")
-
-def get_from_cache(cache_key: str):
-    """
-    Получить значение из PostgreSQL кэша
-    """
-    if pg_connection is None:
-        return None
-    
-    try:
-        cursor = pg_connection.cursor()
-        select_query = "SELECT cache_value FROM prediction_cache WHERE cache_key = %s AND (expires_at IS NULL OR expires_at > NOW())"
-        cursor.execute(select_query, (cache_key,))
-        result = cursor.fetchone()
-        cursor.close()
-        
-        if result:
-            return json.loads(result[0])
-        return None
-    except Exception as e:
-        logger.warning(f"Error reading from PostgreSQL cache: {e}")
-        return None
-
-def set_to_cache(cache_key: str, value: dict, expire_minutes: int = 60):
-    """
-    Сохранить значение в PostgreSQL кэш
-    """
-    if pg_connection is None:
-        return
-    
-    try:
-        cursor = pg_connection.cursor()
-        # Удаляем старую запись, если есть
-        delete_query = "DELETE FROM prediction_cache WHERE cache_key = %s"
-        cursor.execute(delete_query, (cache_key,))
-        
-        # Вставляем новую запись
-        insert_query = """
-        INSERT INTO prediction_cache (cache_key, cache_value, expires_at) 
-        VALUES (%s, %s, NOW() + INTERVAL '%s minutes')
-        ON CONFLICT (cache_key) DO UPDATE 
-        SET cache_value = EXCLUDED.cache_value, expires_at = EXCLUDED.expires_at
-        """
-        cursor.execute(insert_query, (cache_key, json.dumps(value), expire_minutes))
-        pg_connection.commit()
-        cursor.close()
-    except Exception as e:
-        logger.warning(f"Error writing to PostgreSQL cache: {e}")
+# SQL for cache table
+CREATE_CACHE_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS prediction_cache (
+    id SERIAL PRIMARY KEY,
+    cache_key VARCHAR(255) UNIQUE,
+    cache_value TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP
+)
+"""
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global pg_connection, consumer_thread
-
-    # Startup
+    """
+    Lifespan for FastAPI: инициализация БД, кеш-таблицы и запуска consumer.
+    """
+    global engine, consumer_thread
+    # Init DB models (eval_results)
     try:
-        pg_connection = create_postgres_connection_from_config()
-        if pg_connection:
-            init_cache_table()
+        init_db()
+        engine = get_engine()
+        logger.info("Database initialized via init_db()")
     except Exception as e:
-        logger.warning(f"Ошибка при создании PostgreSQL соединения: {e}")
-        pg_connection = None
+        logger.warning(f"Failed to initialize DB on startup: {e}")
+        engine = None
 
+    # Create cache table if engine available
+    if engine is not None:
+        try:
+            with engine.connect() as conn:
+                conn.execute(text(CREATE_CACHE_TABLE_SQL))
+                logger.info("prediction_cache table ensured")
+        except Exception as e:
+            logger.warning(f"Failed to create/ensure prediction_cache table: {e}")
+
+    # Start kafka consumer thread (best-effort)
     try:
         logger.info("Starting Kafka consumer thread")
         consumer_thread = start_kafka_consumer()
     except Exception as e:
-        logger.warning(f"Не удалось запустить Kafka consumer: {e}")
+        logger.warning(f"Failed to start Kafka consumer: {e}")
+        consumer_thread = None
 
-    yield  # Приложение запущено
+    yield
 
-    # Shutdown
+    # Shutdown: stop consumer and dispose engine if possible
     try:
         logger.info("Stopping Kafka consumer")
         stop_kafka_consumer()
     except Exception as e:
-        logger.warning(f"Ошибка при остановке Kafka consumer: {e}")
+        logger.warning(f"Error stopping Kafka consumer: {e}")
 
     try:
-        if pg_connection is not None:
-            pg_connection.close()
+        if engine is not None:
+            engine.dispose()
     except Exception as e:
-        logger.debug(f"Ошибка при закрытии PostgreSQL соединения: {e}")
+        logger.debug(f"Error disposing engine: {e}")
 
 app = FastAPI(lifespan=lifespan)
+
+
+def get_from_cache(cache_key: str):
+    """
+    Read cached JSON value from prediction_cache if present and not expired.
+    Returns Python object or None.
+    """
+    if engine is None:
+        return None
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(
+                text("SELECT cache_value FROM prediction_cache WHERE cache_key = :k AND (expires_at IS NULL OR expires_at > NOW())"),
+                {"k": cache_key}
+            ).fetchone()
+            if result and result[0]:
+                return json.loads(result[0])
+            return None
+    except Exception as e:
+        logger.warning(f"Error reading from cache: {e}")
+        return None
+
+
+def set_to_cache(cache_key: str, value: dict, expire_minutes: int = 60):
+    """
+    Write JSON-serializable `value` into prediction_cache with expiry.
+    """
+    if engine is None:
+        return
+    try:
+        json_value = json.dumps(value, default=str)
+        with engine.begin() as conn:
+            # Upsert using Postgres ON CONFLICT
+            conn.execute(
+                text("""
+                INSERT INTO prediction_cache (cache_key, cache_value, expires_at)
+                VALUES (:k, :v, NOW() + INTERVAL ':m minutes')
+                ON CONFLICT (cache_key) DO UPDATE
+                SET cache_value = EXCLUDED.cache_value, expires_at = EXCLUDED.expires_at
+                """),
+                {"k": cache_key, "v": json_value, "m": str(expire_minutes)}
+            )
+    except Exception as e:
+        logger.warning(f"Error writing to cache: {e}")
+
 
 @app.get("/health")
 async def health_check():
     """
-    Проверка состояния API и подключений
+    Health-check. Проверяем DB доступность и состояние kafka consumer.
     """
-    status = {
-        "status": "healthy",
-        "postgres": "disconnected",
-        "kafka_consumer": "unknown"
-    }
-    
-    # Проверка PostgreSQL
+    status = {"status": "healthy", "postgres": "unknown", "kafka_consumer": "unknown"}
+
+    # DB check
     try:
-        if pg_connection is not None:
-            pg_connection.cursor().execute("SELECT 1")
+        if engine is not None:
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
             status["postgres"] = "connected"
         else:
             status["postgres"] = "not configured"
     except Exception as e:
-        status["postgres"] = f"error: {str(e)}"
-    
-    # Проверка Kafka consumer (если возможно)
+        status["postgres"] = f"error: {e}"
+
+    # Kafka consumer thread check
     try:
         if consumer_thread is not None and consumer_thread.is_alive():
             status["kafka_consumer"] = "running"
@@ -186,12 +165,10 @@ async def health_check():
             status["kafka_consumer"] = "not running"
     except Exception:
         status["kafka_consumer"] = "unknown"
-    
-    overall_status = "healthy" if status["postgres"] in ["connected", "not configured"] else "unhealthy"
-    return {
-        "status": overall_status,
-        "components": status
-    }
+
+    overall = "healthy" if status["postgres"] in ["connected", "not configured"] else "unhealthy"
+    return {"status": overall, "components": status}
+
 
 @app.post("/train/")
 async def train_model(
@@ -199,74 +176,51 @@ async def train_model(
     model_type: str = "d_tree",
     use_config: bool = True,
     save_model: bool = True,
-    # Параметры для Logistic Regression
     solver: str = "lbfgs",
     max_iter: int = 100,
-    # Параметры для Random Forest
     n_estimators: int = 100,
     criterion: str = "entropy",
-    # Параметры для Decision Tree
     max_depth: int = 10,
     min_samples_split: int = 2,
     predict_flag: bool = False
 ):
     """
-    Тренировка модели. По завершении отправляет сообщение в Kafka (producer) в фоне.
+    Train model and (best-effort) send notification to Kafka via background task.
     """
     try:
         multi_model = MultiModel()
 
         if model_type == "log_reg":
             result = multi_model.log_reg(
-                use_config=use_config,
-                solver=solver,
-                max_iter=max_iter,
-                predict=predict_flag,
-                save=save_model
+                use_config=use_config, solver=solver, max_iter=max_iter, predict=predict_flag, save=save_model
             )
         elif model_type == "rand_forest":
             result = multi_model.rand_forest(
-                use_config=use_config,
-                n_estimators=n_estimators,
-                criterion=criterion,
-                predict=predict_flag,
-                save=save_model
+                use_config=use_config, n_estimators=n_estimators, criterion=criterion, predict=predict_flag, save=save_model
             )
         elif model_type == "d_tree":
             result = multi_model.d_tree(
-                use_config=use_config,
-                max_depth=max_depth,
-                min_samples_split=min_samples_split,
-                predict=predict_flag,
-                save=save_model
+                use_config=use_config, max_depth=max_depth, min_samples_split=min_samples_split, predict=predict_flag, save=save_model
             )
         elif model_type == "gnb":
             result = multi_model.gnb(predict=predict_flag, save=save_model)
         else:
-            raise HTTPException(status_code=400, detail=f"Неизвестный тип модели: {model_type}")
+            raise HTTPException(status_code=400, detail=f"Unknown model type: {model_type}")
 
-        # Подготовим уведомление для Kafka — не блокируем основной поток
-        payload = {
-            "event": "model_trained",
-            "model_type": model_type,
-            "result": result,
-            "saved": save_model
-        }
+        payload = {"event": "model_trained", "model_type": model_type, "result": result, "saved": save_model}
         try:
-            background_tasks.add_task(send_prediction, payload, "predictions", False)
+            # send_message(topic, payload) as in code2
+            background_tasks.add_task(send_message, KAFKA_TOPIC, payload)
         except Exception as e:
-            logger.warning(f"Не удалось поставить задачу отправки в Kafka: {e}")
+            logger.warning(f"Failed to schedule send_message to Kafka: {e}")
 
-        return {
-            "model_trained": result,
-            "model_type": model_type,
-            "model_saved": save_model
-        }
+        return {"model_trained": result, "model_type": model_type, "model_saved": save_model}
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Ошибка при обучении модели: {e}", exc_info=True)
+        logger.error(f"Error during training: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/predict/")
 async def predict_model(
@@ -275,87 +229,100 @@ async def predict_model(
     file: UploadFile = None
 ):
     """
-    Эндпоинт предсказаний. Сначала пробуем взять из PostgreSQL cache, иначе выполняем Predict.
-    После получения результата: сохраняем в PostgreSQL (best-effort) и отправляем сообщение в Kafka (в фоне).
+    Prediction endpoint. Try cache first; otherwise predict and save to cache + notify Kafka.
     """
     cache_key = f"predict:{mode}"
 
-    # Попытка чтения из кэша
+    # Try cache
     try:
-        cached_result = get_from_cache(cache_key)
-        if cached_result:
-            return {"from_cache": True, **cached_result}
+        cached = get_from_cache(cache_key)
+        if cached:
+            return {"from_cache": True, **cached}
     except Exception as e:
-        logger.warning(f"Error during PostgreSQL cache check: {e}")
+        logger.warning(f"Cache read error: {e}")
 
     try:
         predictor = Predictor()
 
         if mode == "upload":
             if file is None:
-                raise HTTPException(status_code=400, detail="Файл не предоставлен для режима 'upload'")
+                raise HTTPException(status_code=400, detail="File required for mode 'upload'")
             file_contents = await file.read()
             result = predictor.predict_upload(file_contents)
         elif mode == "smoke":
             result = predictor.predict()
         else:
-            raise HTTPException(status_code=400, detail="Неверный режим. Используйте 'smoke' или 'upload'")
+            raise HTTPException(status_code=400, detail="Invalid mode. Use 'smoke' or 'upload'")
 
-        # JSON-serializable версия
         safe_result = jsonable_encoder(result)
 
-        # Best-effort: сохранить в PostgreSQL кэш
+        # Best-effort: store in cache
         try:
             set_to_cache(cache_key, safe_result)
         except Exception as e:
-            logger.warning(f"Error while writing to PostgreSQL cache: {e}")
+            logger.warning(f"Cache write error: {e}")
 
-        # Отправим результат в Kafka в фоне
+        # Send to Kafka in background
         try:
-            payload = {
-                "event": "prediction",
-                "mode": mode,
-                "prediction": safe_result
-            }
-            background_tasks.add_task(send_prediction, payload, "predictions", False)
+            payload = {"event": "prediction", "mode": mode, "prediction": safe_result}
+            background_tasks.add_task(send_message, KAFKA_TOPIC, payload)
         except Exception as e:
-            logger.warning(f"Не удалось поставить задачу отправки в Kafka: {e}")
+            logger.warning(f"Failed to schedule send_message to Kafka: {e}")
+
+        # Optionally also persist to eval_results table (best-effort) using InferenceResult
+        try:
+            sess = get_session()
+            rec = InferenceResult(input_data=json.dumps(safe_result, ensure_ascii=False), prediction=None)
+            sess.add(rec)
+            sess.commit()
+            sess.close()
+        except Exception as e:
+            logger.debug(f"Failed to persist prediction to eval_results: {e}")
 
         return safe_result
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Ошибка при предсказании: {e}", exc_info=True)
+        logger.error(f"Error in predict endpoint: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/receive_result")
 async def receive_result(payload: dict):
     """
-    Опциональный endpoint, если вы используете отдельный consumer/service и хотите,
-    чтобы он присылал результаты обратно в web (например для подтверждения, логирования).
+    Endpoint to accept results pushed by external consumer/services.
+    Optionally save to eval_results table.
     """
     try:
         logger.info(f"Received result via /receive_result: {payload}")
-        # При необходимости можно сохранить payload в PostgreSQL, БД и т.д.
+        # Best-effort persist
         try:
-            if pg_connection is not None:
-                cache_key = f"received:{payload.get('meta', {}).get('request_id', '')}"
-                set_to_cache(cache_key, payload)
+            sess = get_session()
+            inp = payload.get("input") or payload
+            pred = None
+            # try to extract numeric prediction if present
+            if isinstance(payload.get("prediction"), (int, float, str)):
+                try:
+                    pred = float(payload.get("prediction"))
+                except Exception:
+                    pred = None
+            rec = InferenceResult(input_data=json.dumps(inp, default=str, ensure_ascii=False), prediction=pred)
+            sess.add(rec)
+            sess.commit()
+            sess.close()
         except Exception as e:
-            logger.warning(f"Не удалось записать полученный результат в PostgreSQL: {e}")
+            logger.warning(f"Failed to save received payload to eval_results: {e}")
         return {"status": "ok"}
     except Exception as e:
-        logger.error(f"Ошибка в receive_result: {e}", exc_info=True)
+        logger.error(f"Error in receive_result: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+
 if __name__ == "__main__":
-    config = configparser.ConfigParser()
-    current_dir = os.path.dirname(__file__)
-    config_path = os.path.join(current_dir, '..', "config.ini")
-    config.read(config_path, encoding="utf-8")
+    # If running directly, ensure DB tables exist
     try:
-        host = config["FASTAPI"]["host"]
-        port = config.getint("FASTAPI", "port")
-    except KeyError:
-        raise ValueError("В config.ini отсутствует секция [FASTAPI] или ключи host/port")
-    uvicorn.run(app, host=host, port=port)
+        init_db()
+    except Exception as e:
+        print(f"init_db failed: {e}")
+
+    # run via uvicorn externally as needed
