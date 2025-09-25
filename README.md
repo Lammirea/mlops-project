@@ -16,7 +16,7 @@ The data is stored in minio, which runs alongside the other services of the proj
 
 ## Project structure
 
----
+```
 MLOPS_PROJECT/
 ├── data /                          # Папка с данными для обучения и тестирования модели (датасет CICIDS2017)
 ├── DevOps/
@@ -59,7 +59,7 @@ MLOPS_PROJECT/
 ├── bash.bat                         # Батник для запуска на Windows
 ├── config.ini                       # Конфигурационный файл
 └── docker-compose.yml               # Docker Compose для локального развертывания
----
+```
 
 ## API Endpoints
 
