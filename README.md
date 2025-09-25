@@ -16,6 +16,7 @@ The data is stored in minio, which runs alongside the other services of the proj
 
 ## Project structure
 
+---
 MLOPS_PROJECT/
 ├── data /                          # Папка с данными для обучения и тестирования модели (датасет CICIDS2017)
 ├── DevOps/
@@ -40,7 +41,6 @@ MLOPS_PROJECT/
 ├── src/                             # Основной код приложения
 │   ├── tests/                   # функциональные тесты
 │   ├── unit_tests/              # Юнит-тесты
-│   ├── __init__.py
 │   ├── app.py                       # API
 │   ├── kafka_consumer_service.py    
 │   ├── kafka_consumer.py            
@@ -59,6 +59,7 @@ MLOPS_PROJECT/
 ├── bash.bat                         # Батник для запуска на Windows
 ├── config.ini                       # Конфигурационный файл
 └── docker-compose.yml               # Docker Compose для локального развертывания
+---
 
 ## API Endpoints
 
