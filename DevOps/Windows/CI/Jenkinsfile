@@ -84,8 +84,7 @@ pipeline {
                             docker run --rm -v "%cd%":/app -w /app -e MINIO_ENDPOINT=%MINIO_ENDPOINT% -e MINIO_ACCESS_KEY=%MINIO_ACCESS_KEY% -e MINIO_SECRET_KEY=%MINIO_SECRET_KEY% python:3.11-bullseye bash -lc " \
                             set -euo pipefail; \
                             echo 'Installing dvc...'; \
-                            python -m pip install --upgrade pip setuptools wheel >/dev/null; \
-                            pip install 'dvc[s3]' --root-user-action=ignore --no-cache-dir >/dev/null; \
+                            pip install "dvc[s3]==2.9.3" --root-user-action=ignore --no-cache-dir \
                             cd /app; \
                             if [ ! -d .dvc ]; then \
                                 echo '.dvc not found — running dvc init'; \
