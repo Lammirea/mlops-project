@@ -2,11 +2,16 @@
 
 The executed branch of this project is "develop". If everything gonna be alright i merge "develop" and "main".
 
-In this oroject i train three ML models on CICIDS2017 dataset for attack type classification.
+In this oroject i train three ML models on [CICIDS2017](https://www.kaggle.com/datasets/ernie55ernie/improved-cicids2017-and-csecicids2018) dataset for attack type classification.
 
 ## Data
 
 The data is stored in minio, which runs alongside the other services of the project.
+If you dont want to download data you can use docker image by the coomand below:
+
+```
+docker push derelia/mlops_project
+```
 
 ## Arcitecture
 
@@ -22,7 +27,7 @@ MLOPS_PROJECT/
 ├── DevOps/
 │   └── Windows/
 │       ├── CI/                     # Скрипт CI для Jenkins
-|       └── CD/                     # Скрипт для CD Jenkins                  
+|       └── CD/                     # Скрипт для CD Jenkins
 ├── experiments/                     # Эксперименты с моделями ML
 │   ├── d_tree.sav
 │   ├── decision_tree_model.sav
@@ -42,9 +47,9 @@ MLOPS_PROJECT/
 │   ├── tests/                   # функциональные тесты
 │   ├── unit_tests/              # Юнит-тесты
 │   ├── app.py                       # API
-│   ├── kafka_consumer_service.py    
-│   ├── kafka_consumer.py            
-│   ├── kafka_producer.py            
+│   ├── kafka_consumer_service.py
+│   ├── kafka_consumer.py
+│   ├── kafka_producer.py
 │   ├── logfile.log                  # Лог-файл приложения
 │   ├── logger.py                    # Настройка логирования
 │   ├── predict.py                   # Скрипт предсказания
