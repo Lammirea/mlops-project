@@ -8,7 +8,12 @@ import boto3
 from botocore.client import Config
 import io
 
-from logger import Logger
+import sys
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from src.logger import Logger
 
 SHOW_LOG = True
 
@@ -74,7 +79,7 @@ class DataMaker:
         """
         Получает конфигурацию MinIO из переменных окружения
         """
-        endpoint_url = os.getenv('MINIO_ENDPOINT', 'http://localhost:9000')
+        endpoint_url = os.getenv('MINIO_ENDPOINT', 'http://minio:9000')
         access_key = os.getenv('MINIO_ACCESS_KEY', 'minioadmin')
         secret_key = os.getenv('MINIO_SECRET_KEY', 'minioadmin')
         bucket_name = os.getenv('DVC_REMOTE_NAME', 'data')

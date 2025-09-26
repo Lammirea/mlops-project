@@ -144,7 +144,7 @@ class MultiModel:
         """
         Получает конфигурацию MinIO из переменных окружения
         """
-        endpoint_url = os.getenv('MINIO_ENDPOINT', 'http://localhost:9000')
+        endpoint_url = os.getenv('MINIO_ENDPOINT', 'http://minio:9000')
         access_key = os.getenv('MINIO_ACCESS_KEY', 'minioadmin')
         secret_key = os.getenv('MINIO_SECRET_KEY', 'minioadmin')
         bucket_name = os.getenv('DVC_REMOTE_NAME', 'data')
@@ -304,4 +304,4 @@ class MultiModel:
         
 if __name__ == "__main__":
     multi_model = MultiModel()
-    multi_model.log_reg(use_config=False, predict=True)
+    multi_model.d_tree(use_config=False, predict=True)

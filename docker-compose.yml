@@ -1,39 +1,37 @@
 version: "3.8"
 services:
   zookeeper:
-    image: bitnami/zookeeper:latest
+    image: confluentinc/cp-zookeeper:latest
     environment:
-      - ALLOW_ANONYMOUS_LOGIN=yes
+      ZOOKEEPER_CLIENT_PORT: 2181
     ports:
       - "2181:2181"
-    networks:
-      - app-network
 
   kafka:
-    image: bitnami/kafka:latest
-    environment:
-      # используем Zookeeper (чтобы не смешивать KRaft-конфиг)
-      - KAFKA_ZOOKEEPER_CONNECT=zookeeper:2181
-      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
-      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092
-      - ALLOW_PLAINTEXT_LISTENER=yes
-    ports:
-      - "9092:9092"
+    image: confluentinc/cp-kafka:7.5.0
     depends_on:
       - zookeeper
-    networks:
-      - app-network
-    volumes:
-      - kafka_data:/bitnami/kafka
-    restart: unless-stopped
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/localhost/9092"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   postgres:
     image: postgres:16-alpine
-    container_name: postgres
     environment:
-      - POSTGRES_USER
-      - POSTGRES_PASSWORD
-      - POSTGRES_DB
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     ports:
       - "5432:5432"
     volumes:
@@ -44,8 +42,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
-    networks:
-      - app-network
 
   minio:
     image: minio/minio:latest
@@ -57,40 +53,52 @@ services:
       MINIO_ROOT_PASSWORD: minioadmin
     command: server /data --console-address ":9001"
     volumes:
-      - ./data:/data
+      - ./data:/data # Изменено: монтируем локальную папку data
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/ready || exit 1"]
+      test:
+        [
+          "CMD-SHELL",
+          "curl -f http://localhost:9000/minio/health/ready || exit 1",
+        ]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 5s
-    networks:
-      - app-network
 
   minio-init:
     image: minio/mc:latest
     depends_on:
-      - minio
-    entrypoint: ["sh", "-c"]
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./data:/data-local:ro # Изменено: монтируем локальную папку data
+    entrypoint: ["/bin/sh", "-c"]
     command: |
-      "
       set -e
-      i=0
-      until mc alias set myminio http://minio:9000 minioadmin minioadmin >/dev/null 2>&1 || [ $i -ge 30 ]; do
-        i=$((i+1))
-        sleep 1
+      # Ждём, пока MinIO будет готов
+      echo "Ждём MinIO..."
+      until mc alias set myminio http://minio:9000 minioadmin minioadmin; do
+        echo "Повтор подключения..."
+        sleep 2
       done
-      mc alias set myminio http://minio:9000 minioadmin minioadmin
+      echo "Создаём бакеты..."
       mc mb myminio/data --ignore-existing
       mc mb myminio/models --ignore-existing
       mc mb myminio/experiments --ignore-existing
+      echo "Проверяем, есть ли файлы в /data-local..."
+      ls -la /data-local || echo "Папка /data-local пуста или не существует"
+      if [ -d /data-local ] && [ "$(ls -A /data-local)" ]; then
+        echo "Копируем файлы из /data-local в myminio/data..."
+        mc cp --recursive /data-local/ myminio/data/  # Добавлены слеши для корректного пути
+        echo "Файлы скопированы."
+      else
+        echo "Нет файлов для копирования."
+      fi
       mc anonymous set public myminio/data
       mc anonymous set public myminio/models
       mc anonymous set public myminio/experiments
-      "
-    restart: "on-failure"
-    networks:
-      - app-network
+      echo "Инициализация завершена."
+    restart: "no"
 
   web:
     build: .
@@ -106,49 +114,36 @@ services:
     env_file:
       - .env
     environment:
-      - KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BOOTSTRAP_SERVERS}
-      - KAFKA_TOPIC=${KAFKA_TOPIC}
-      - POSTGRES_HOST=${POSTGRES_HOST}
-      - POSTGRES_PORT=${POSTGRES_PORT}
-      - POSTGRES_DB=${POSTGRES_DB}
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - MINIO_ENDPOINT=${MINIO_ENDPOINT}
-      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
-      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
-      - DVC_REMOTE_NAME=${DVC_REMOTE_NAME}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
+      KAFKA_TOPIC: ${KAFKA_TOPIC}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      DVC_REMOTE_NAME: ${DVC_REMOTE_NAME}
     image: derelia/mlops_project:latest
-    networks:
-      - app-network
     restart: unless-stopped
 
   consumer:
-    image: derelia/mlops_project:latest
+    build:
+      context: .
+    command: python src/kafka_consumer.py
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_DB: ${POSTGRES_DB}
+      KAFKA_BOOTSTRAP: kafka:9092
+      KAFKA_TOPIC: send_prediction
     depends_on:
       - kafka
       - postgres
-    command: >
-      bash -c "python -u src/kafka_consumer_service.py"
-    env_file:
-      - .env
-    environment:
-      - KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BOOTSTRAP_SERVERS}
-      - KAFKA_TOPIC=${KAFKA_TOPIC}
-      - POSTGRES_HOST=${POSTGRES_HOST}
-      - POSTGRES_PORT=${POSTGRES_PORT}
-      - POSTGRES_DB=${POSTGRES_DB}
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-    networks:
-      - app-network
-    restart: unless-stopped
-
-networks:
-  app-network:
-    driver: bridge
 
 volumes:
   postgres-data:
-  minio_data:
   kafka_data:
     driver: local

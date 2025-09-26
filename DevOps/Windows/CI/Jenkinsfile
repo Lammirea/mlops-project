@@ -30,30 +30,24 @@ pipeline {
         stage('Decrypt .env via Ansible') {
             steps {
                 dir('mlops-project') {
-                    // ansible_vault_password должен быть добавлен в Jenkins Credentials (type: Secret text)
                     withCredentials([string(credentialsId: 'ansible_vault_password', variable: 'VAULT_PASS')]) {
                         bat '''
                             chcp 65001
                             setlocal enabledelayedexpansion
 
-                            REM --- Убедимся, что директория infra/ansible есть (на всякий случай)
                             if not exist infra\\ansible mkdir infra\\ansible
                             if not exist infra\\ansible\\playbooks mkdir infra\\ansible\\playbooks
                             if not exist infra\\ansible\\group_vars mkdir infra\\ansible\\group_vars
                             if not exist infra\\ansible\\group_vars\\all mkdir infra\\ansible\\group_vars\\all
 
-                            REM --- создаём временный файл с паролем для ansible-vault (удалим позже)
                             echo %VAULT_PASS% > infra\\ansible\\.vault_pass.txt
 
-                            REM --- Запускаем Docker-контейнер на базе python и устанавливаем ansible через pip, затем запускаем playbook
-                            REM --- Монтируем текущую директорию в /app и используем /app/infra/ansible/ansible.cfg
                             docker run --rm -v "%cd%":/app -w /app -e ANSIBLE_CONFIG=/app/infra/ansible/ansible.cfg python:3.11-bullseye bash -lc ^
                                 "python -m pip install --upgrade pip setuptools wheel >/dev/null && ^
                                 pip install ansible --root-user-action=ignore >/dev/null && ^
                                 ansible-playbook infra/ansible/playbooks/deploy_env.yml --vault-password-file infra/ansible/.vault_pass.txt"
-                            REM --- Удаляем временный файл пароля
-                            del infra\\ansible\\.vault_pass.txt
 
+                            del infra\\ansible\\.vault_pass.txt
                             endlocal
                         '''
                     }
@@ -72,19 +66,18 @@ pipeline {
                         bat '''
                             chcp 65001
 
-                            REM --- Бэкап и удаление problem config (если он есть)
                             if exist .dvc\\config (
-                            echo Backing up existing .dvc\\config to .dvc\\config.bak
-                            copy /Y .dvc\\config .dvc\\config.bak
-                            attrib -R .dvc\\config 2>nul || echo attrib failed or not needed
-                            del /F .dvc\\config 2>nul || echo delete failed or file was locked
+                                echo Backing up existing .dvc\\config to .dvc\\config.bak
+                                copy /Y .dvc\\config .dvc\\config.bak
+                                attrib -R .dvc\\config 2>nul || echo attrib failed or not needed
+                                del /F .dvc\\config 2>nul || echo delete failed or file was locked
                             )
 
-                            REM --- Устанавливаем dvc и выполняем init / remote config в одном контейнере
                             docker run --rm -v "%cd%":/app -w /app -e MINIO_ENDPOINT=%MINIO_ENDPOINT% -e MINIO_ACCESS_KEY=%MINIO_ACCESS_KEY% -e MINIO_SECRET_KEY=%MINIO_SECRET_KEY% python:3.11-bullseye bash -lc " \
                             set -euo pipefail; \
-                            echo 'Installing dvc...'; \
-                            pip install "dvc[s3]==2.9.3" --root-user-action=ignore --no-cache-dir \
+                            echo 'Installing latest DVC with S3 support...'; \
+                            python -m pip install --upgrade pip setuptools wheel >/dev/null; \
+                            python -m pip install 'dvc[s3]' --no-cache-dir --root-user-action=ignore && \
                             cd /app; \
                             if [ ! -d .dvc ]; then \
                                 echo '.dvc not found — running dvc init'; \
@@ -94,13 +87,12 @@ pipeline {
                             fi; \
                             echo 'Adding/ensuring remote storage'; \
                             dvc remote add -d storage s3://data || true; \
-                            dvc remote modify storage endpointurl \"$MINIO_ENDPOINT\"; \
-                            dvc remote modify storage access_key_id \"$MINIO_ACCESS_KEY\"; \
-                            dvc remote modify storage secret_access_key \"$MINIO_SECRET_KEY\"; \
+                            dvc remote modify storage endpointurl \"\$MINIO_ENDPOINT\"; \
+                            dvc remote modify storage access_key_id \"\$MINIO_ACCESS_KEY\"; \
+                            dvc remote modify storage secret_access_key \"\$MINIO_SECRET_KEY\"; \
                             echo 'DVC setup completed' \
                             "
                         '''
-
                     }
                 }
             }
@@ -116,16 +108,12 @@ pipeline {
                     ]) {
                         bat '''
                             chcp 65001
-                            REM --- запускаем MinIO для юнит-тестов
                             docker-compose up -d minio minio-init
-                            
-                            REM --- ждем пока MinIO запустится
                             timeout /t 30 /nobreak
-                            
-                            REM --- запускаем юнит-тесты в контейнере с подключением к MinIO
+
                             docker run --network="host" --rm -v "%cd%":/app -w /app -e MINIO_ENDPOINT=%MINIO_ENDPOINT% -e MINIO_ACCESS_KEY=%MINIO_ACCESS_KEY% -e MINIO_SECRET_KEY=%MINIO_SECRET_KEY% python:3.11-bullseye bash -c " \
-                            python -m pip install --upgrade pip setuptools wheel && \
-                            pip install -r requirements.txt coverage pytest dvc[s3] --root-user-action=ignore && \
+                            python -m pip install --upgrade pip setuptools wheel >/dev/null; \
+                            python -m pip install -r requirements.txt coverage pytest 'dvc[s3]' --root-user-action=ignore --no-cache-dir && \
                             coverage run -m pytest src/unit_tests -q --maxfail=1 --disable-warnings && \
                             coverage xml -i && \
                             coverage html -d coverage_html \
@@ -159,7 +147,6 @@ pipeline {
                             ]) {
                                 bat '''
                                     chcp 65001
-                                    REM --- дописываем параметры postgresql в .env
                                     echo POSTGRES_HOST=%POSTGRES_HOST% >> .env
                                     echo POSTGRES_PORT=%POSTGRES_PORT% >> .env
                                     echo POSTGRES_DB=%POSTGRES_DB% >> .env
@@ -195,13 +182,13 @@ pipeline {
         stage('Checkout coverage report') {
             steps {
                 dir('mlops-project') {
-                bat 'chcp 65001 && type coverage.xml || echo "coverage.xml not found"'
-                publishHTML (target: [
-                    reportDir: 'coverage_html',
-                    reportFiles: 'index.html',
-                    reportName: 'Coverage Report',
-                    keepAll: true
-                ])
+                    bat 'chcp 65001 && type coverage.xml || echo "coverage.xml not found"'
+                    publishHTML (target: [
+                        reportDir: 'coverage_html',
+                        reportFiles: 'index.html',
+                        reportName: 'Coverage Report',
+                        keepAll: true
+                    ])
                 }
             }
         }
